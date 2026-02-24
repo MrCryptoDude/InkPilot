@@ -1,0 +1,3 @@
+# Inkpilot MCP Server
+mcp[cli]>=1.0.0
+lxml>=4.9.0

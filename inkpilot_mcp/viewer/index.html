@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Inkpilot — Live Canvas</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0e1a;
+    color: #e2e8f0;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  header {
+    background: #0f1629;
+    border-bottom: 2px solid #1e3a5f;
+    padding: 8px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .logo-icon {
+    width: 30px; height: 30px;
+    background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+  }
+
+  .logo-text { font-size: 17px; font-weight: 800; color: #60a5fa; }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #94a3b8;
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #22c55e;
+    transition: all 0.3s;
+  }
+
+  .status-dot.drawing {
+    background: #f59e0b;
+    animation: pulse 0.8s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.3); }
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .btn {
+    background: #1e293b;
+    border: 1px solid #334155;
+    color: #cbd5e1;
+    padding: 6px 14px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.2s;
+  }
+  .btn:hover { background: #334155; color: #f1f5f9; }
+  .btn-primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .btn-primary:hover { background: #1d4ed8; }
+
+  .canvas-wrapper {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    position: relative;
+    background: radial-gradient(circle at 50% 50%, #0f172a 0%, #0a0e1a 100%);
+    /* Checkerboard transparency background */
+    background-image:
+      linear-gradient(45deg, #111827 25%, transparent 25%),
+      linear-gradient(-45deg, #111827 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #111827 75%),
+      linear-gradient(-45deg, transparent 75%, #111827 75%);
+    background-size: 20px 20px;
+    background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+  }
+
+  .canvas-frame {
+    position: relative;
+    border: 2px solid #1e3a5f;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow:
+      0 0 40px rgba(59, 130, 246, 0.08),
+      0 4px 24px rgba(0, 0, 0, 0.4);
+    background: #ffffff;
+    transition: box-shadow 0.3s, border-color 0.3s;
+  }
+
+  .canvas-frame.active {
+    border-color: #3b82f6;
+    box-shadow:
+      0 0 60px rgba(59, 130, 246, 0.2),
+      0 4px 24px rgba(0, 0, 0, 0.4);
+  }
+
+  .canvas-frame svg {
+    display: block;
+    /* Fill as much of the viewport as possible */
+    width: auto;
+    height: auto;
+    min-width: 500px;
+    min-height: 500px;
+    max-width: calc(100vw - 48px);
+    max-height: calc(100vh - 100px);
+  }
+
+  footer {
+    background: #0f1629;
+    border-top: 1px solid #1e293b;
+    padding: 6px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    color: #475569;
+    flex-shrink: 0;
+  }
+
+  .update-count { color: #3b82f6; font-weight: bold; }
+  .canvas-size { color: #64748b; }
+
+  .splash {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: rgba(10, 14, 26, 0.95);
+    z-index: 10;
+    transition: opacity 0.5s;
+  }
+
+  .splash.hidden { opacity: 0; pointer-events: none; }
+  .splash-icon { font-size: 48px; }
+  .splash-text { font-size: 20px; color: #60a5fa; font-weight: 600; }
+  .splash-sub { font-size: 14px; color: #64748b; max-width: 400px; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">✦</div>
+    <span class="logo-text">Inkpilot</span>
+    <div class="status">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Connected</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <button class="btn btn-primary" onclick="openInInkscape()">Open in Inkscape</button>
+    <button class="btn" onclick="downloadSVG()">⬇ Save SVG</button>
+  </div>
+</header>
+
+<div class="canvas-wrapper">
+  <div class="splash" id="splash">
+    <div class="splash-icon">✦</div>
+    <div class="splash-text">Waiting for Claude...</div>
+    <div class="splash-sub">
+      Ask Claude to draw something and watch it appear here in real-time.
+      <br><br>
+      Try: "Draw a 16x16 pixel art sword with a brown hilt and silver blade"
+    </div>
+  </div>
+
+  <div class="canvas-frame" id="canvasFrame">
+    <div id="svgContainer"></div>
+  </div>
+</div>
+
+<footer>
+  <span><span class="update-count" id="updateCount">0</span> updates</span>
+  <span class="canvas-size" id="canvasSize"></span>
+  <span id="lastUpdate">Waiting...</span>
+</footer>
+
+<script>
+  const svgContainer = document.getElementById('svgContainer');
+  const statusDot = document.getElementById('statusDot');
+  const statusText = document.getElementById('statusText');
+  const canvasFrame = document.getElementById('canvasFrame');
+  const splash = document.getElementById('splash');
+  const updateCountEl = document.getElementById('updateCount');
+  const lastUpdateEl = document.getElementById('lastUpdate');
+  const canvasSizeEl = document.getElementById('canvasSize');
+
+  let updateCount = 0;
+  let lastSvg = '';
+  let drawingTimeout = null;
+
+  function connect() {
+    const es = new EventSource('/events');
+
+    es.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.svg && data.svg !== lastSvg) {
+          lastSvg = data.svg;
+          svgContainer.innerHTML = data.svg;
+
+          updateCount++;
+          updateCountEl.textContent = updateCount;
+          lastUpdateEl.textContent = new Date().toLocaleTimeString();
+
+          const match = data.svg.match(/viewBox="0 0 (\d+) (\d+)"/);
+          if (match) {
+            canvasSizeEl.textContent = `${match[1]}×${match[2]}`;
+          }
+
+          splash.classList.add('hidden');
+          canvasFrame.classList.add('active');
+          statusDot.classList.add('drawing');
+          statusText.textContent = 'Drawing...';
+
+          clearTimeout(drawingTimeout);
+          drawingTimeout = setTimeout(() => {
+            canvasFrame.classList.remove('active');
+            statusDot.classList.remove('drawing');
+            statusText.textContent = 'Ready';
+          }, 2000);
+        }
+      } catch (e) {
+        console.error('Parse error:', e);
+      }
+    };
+
+    es.onerror = () => {
+      statusDot.style.background = '#ef4444';
+      statusText.textContent = 'Disconnected — retrying...';
+      es.close();
+      setTimeout(connect, 3000);
+    };
+
+    es.onopen = () => {
+      statusDot.style.background = '#22c55e';
+      statusText.textContent = 'Connected';
+    };
+  }
+
+  function downloadSVG() {
+    if (!lastSvg) return;
+    const blob = new Blob([lastSvg], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `inkpilot_${Date.now()}.svg`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function openInInkscape() {
+    fetch('/open-inkscape', { method: 'POST' }).catch(() => {});
+  }
+
+  connect();
+</script>
+</body>
+</html>

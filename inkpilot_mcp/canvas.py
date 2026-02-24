@@ -1,0 +1,383 @@
+"""
+Inkpilot MCP — SVG Canvas
+Maintains an in-memory SVG document.
+Notifies listeners on every change for live preview.
+"""
+from lxml import etree
+import threading
+import time
+import os
+
+SVG_NS = "http://www.w3.org/2000/svg"
+INKSCAPE_NS = "http://www.inkscape.org/namespaces/inkscape"
+SODIPODI_NS = "http://sodipodi.sourceforge.net/DTD/sodipodi-0.0.dtd"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+
+NSMAP = {
+    None: SVG_NS,
+    "inkscape": INKSCAPE_NS,
+    "sodipodi": SODIPODI_NS,
+    "xlink": XLINK_NS,
+}
+
+_counter = 0
+_counter_lock = threading.Lock()
+
+
+def _next_id(prefix="el"):
+    global _counter
+    with _counter_lock:
+        _counter += 1
+        return f"{prefix}_{_counter:04d}"
+
+
+class SVGCanvas:
+    """
+    In-memory SVG canvas with change notifications.
+    Every mutation triggers on_change callbacks for live preview.
+    """
+
+    def __init__(self, width=512, height=512):
+        self.width = width
+        self.height = height
+        self.root = self._create_root(width, height)
+        self.active_layer = None
+        self._listeners = []
+        self._lock = threading.Lock()
+
+    def _create_root(self, w, h):
+        root = etree.Element(f"{{{SVG_NS}}}svg", nsmap=NSMAP)
+        root.set("width", str(w))
+        root.set("height", str(h))
+        root.set("viewBox", f"0 0 {w} {h}")
+        root.set("version", "1.1")
+        # Empty defs block (no background — Inkscape shows its own checkerboard)
+        etree.SubElement(root, f"{{{SVG_NS}}}defs")
+        return root
+
+    def on_change(self, callback):
+        """Register a listener called on every canvas mutation."""
+        self._listeners.append(callback)
+
+    def _notify(self):
+        svg_str = self.to_svg()
+        for cb in self._listeners:
+            try:
+                cb(svg_str)
+            except Exception:
+                pass
+
+    def to_svg(self):
+        """Return current SVG as string."""
+        with self._lock:
+            return etree.tostring(self.root, encoding="unicode", pretty_print=True)
+
+    def save(self, path):
+        """Save SVG to file."""
+        with self._lock:
+            tree = etree.ElementTree(self.root)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tree.write(path, xml_declaration=True, encoding="utf-8", pretty_print=True)
+        return path
+
+    def _get_parent(self):
+        """Get current insertion point (active layer or root)."""
+        if self.active_layer is not None:
+            return self.active_layer
+        return self.root
+
+    def _find_layer(self, label):
+        for g in self.root.iter(f"{{{SVG_NS}}}g"):
+            if g.get(f"{{{INKSCAPE_NS}}}groupmode") == "layer":
+                if g.get(f"{{{INKSCAPE_NS}}}label") == label:
+                    return g
+        return None
+
+    # ── Canvas Setup ─────────────────────────────────────────────
+
+    def set_canvas(self, width, height):
+        with self._lock:
+            self.width = width
+            self.height = height
+            self.root.set("width", str(width))
+            self.root.set("height", str(height))
+            self.root.set("viewBox", f"0 0 {width} {height}")
+        self._notify()
+        return f"Canvas set to {width}x{height}"
+
+    def clear(self):
+        with self._lock:
+            # Remove everything except defs
+            to_remove = []
+            for child in self.root:
+                tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if tag == "defs":
+                    continue
+                to_remove.append(child)
+            for child in to_remove:
+                self.root.remove(child)
+            self.active_layer = None
+        self._notify()
+        return "Canvas cleared"
+
+    # ── Layer Management ─────────────────────────────────────────
+
+    def create_layer(self, label, visible=True, locked=False):
+        with self._lock:
+            existing = self._find_layer(label)
+            if existing is not None:
+                self.active_layer = existing
+                return f"Layer '{label}' already exists, now active"
+
+            layer_id = _next_id("layer")
+            layer = etree.SubElement(self.root, f"{{{SVG_NS}}}g", id=layer_id)
+            layer.set(f"{{{INKSCAPE_NS}}}groupmode", "layer")
+            layer.set(f"{{{INKSCAPE_NS}}}label", label)
+            if not visible:
+                layer.set("style", "display:none")
+            if locked:
+                layer.set(f"{{{SODIPODI_NS}}}insensitive", "true")
+            self.active_layer = layer
+        self._notify()
+        return f"Layer '{label}' created (id={layer_id})"
+
+    def switch_layer(self, label):
+        with self._lock:
+            layer = self._find_layer(label)
+            if layer is None:
+                return f"Layer '{label}' not found"
+            self.active_layer = layer
+        return f"Switched to layer '{label}'"
+
+    # ── Drawing Tools ────────────────────────────────────────────
+
+    def draw_rect(self, x, y, width, height, fill="#ffffff", stroke=None,
+                  stroke_width=None, rx=0, ry=0, opacity=None, id=None, label=None):
+        with self._lock:
+            eid = id or _next_id("rect")
+            attrs = {"id": eid, "x": str(x), "y": str(y),
+                     "width": str(width), "height": str(height)}
+            if rx:
+                attrs["rx"] = str(rx)
+            if ry:
+                attrs["ry"] = str(ry)
+
+            style = f"fill:{fill}"
+            if stroke:
+                style += f";stroke:{stroke}"
+            if stroke_width is not None:
+                style += f";stroke-width:{stroke_width}"
+            if opacity is not None:
+                style += f";opacity:{opacity}"
+            attrs["style"] = style
+
+            if label:
+                attrs[f"{{{INKSCAPE_NS}}}label"] = label
+
+            elem = etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}rect", **attrs)
+        self._notify()
+        return eid
+
+    def draw_circle(self, cx, cy, r, fill="#ffffff", stroke=None,
+                    stroke_width=None, opacity=None, id=None, label=None):
+        with self._lock:
+            eid = id or _next_id("circle")
+            attrs = {"id": eid, "cx": str(cx), "cy": str(cy), "r": str(r)}
+            style = f"fill:{fill}"
+            if stroke:
+                style += f";stroke:{stroke}"
+            if stroke_width is not None:
+                style += f";stroke-width:{stroke_width}"
+            if opacity is not None:
+                style += f";opacity:{opacity}"
+            attrs["style"] = style
+            if label:
+                attrs[f"{{{INKSCAPE_NS}}}label"] = label
+            etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}circle", **attrs)
+        self._notify()
+        return eid
+
+    def draw_ellipse(self, cx, cy, rx, ry, fill="#ffffff", stroke=None, id=None):
+        with self._lock:
+            eid = id or _next_id("ellipse")
+            attrs = {"id": eid, "cx": str(cx), "cy": str(cy),
+                     "rx": str(rx), "ry": str(ry)}
+            style = f"fill:{fill}"
+            if stroke:
+                style += f";stroke:{stroke}"
+            attrs["style"] = style
+            etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}ellipse", **attrs)
+        self._notify()
+        return eid
+
+    def draw_line(self, x1, y1, x2, y2, stroke="#ffffff", stroke_width=2, id=None):
+        with self._lock:
+            eid = id or _next_id("line")
+            attrs = {"id": eid, "x1": str(x1), "y1": str(y1),
+                     "x2": str(x2), "y2": str(y2),
+                     "style": f"stroke:{stroke};stroke-width:{stroke_width}"}
+            etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}line", **attrs)
+        self._notify()
+        return eid
+
+    def draw_path(self, d, fill="none", stroke="#ffffff", stroke_width=1, id=None, label=None):
+        with self._lock:
+            eid = id or _next_id("path")
+            style = f"fill:{fill};stroke:{stroke};stroke-width:{stroke_width}"
+            attrs = {"id": eid, "d": d, "style": style}
+            if label:
+                attrs[f"{{{INKSCAPE_NS}}}label"] = label
+            etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}path", **attrs)
+        self._notify()
+        return eid
+
+    def draw_text(self, x, y, content, font_size=16, fill="#ffffff",
+                  font_family="sans-serif", id=None):
+        with self._lock:
+            eid = id or _next_id("text")
+            attrs = {"id": eid, "x": str(x), "y": str(y),
+                     "style": f"font-size:{font_size}px;fill:{fill};font-family:{font_family}"}
+            elem = etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}text", **attrs)
+            elem.text = content
+        self._notify()
+        return eid
+
+    def draw_polygon(self, points, fill="#ffffff", stroke=None, id=None):
+        with self._lock:
+            eid = id or _next_id("polygon")
+            style = f"fill:{fill}"
+            if stroke:
+                style += f";stroke:{stroke}"
+            attrs = {"id": eid, "points": points, "style": style}
+            etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}polygon", **attrs)
+        self._notify()
+        return eid
+
+    # ── Pixel Art (the star of the show) ─────────────────────────
+
+    def draw_pixel(self, x, y, color, size=8):
+        """Draw a single pixel. For live drawing effect."""
+        with self._lock:
+            eid = _next_id("px")
+            attrs = {"id": eid,
+                     "x": str(x * size), "y": str(y * size),
+                     "width": str(size), "height": str(size),
+                     "style": f"fill:{color}"}
+            etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}rect", **attrs)
+        self._notify()
+        return eid
+
+    def draw_pixel_row(self, y, colors, size=8, start_x=0):
+        """
+        Draw an entire row of pixels at once.
+        colors: list of color strings (null/None = transparent/skip)
+        Creates a nice 'scanning' effect when called row by row.
+        """
+        ids = []
+        with self._lock:
+            for x, color in enumerate(colors):
+                if color is None or color == "null" or color == "":
+                    continue
+                eid = _next_id("px")
+                attrs = {"id": eid,
+                         "x": str((start_x + x) * size),
+                         "y": str(y * size),
+                         "width": str(size), "height": str(size),
+                         "style": f"fill:{color}"}
+                etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}rect", **attrs)
+                ids.append(eid)
+        self._notify()
+        return ids
+
+    def draw_pixel_region(self, pixels, size=8, offset_x=0, offset_y=0, label=None):
+        """
+        Draw a batch of pixels as a named group.
+        pixels: list of [x, y, color] triples
+        Great for drawing body parts: hilt, blade, etc.
+        """
+        ids = []
+        with self._lock:
+            group = etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}g",
+                                     id=_next_id("region"))
+            if label:
+                group.set(f"{{{INKSCAPE_NS}}}label", label)
+            for px in pixels:
+                x, y, color = px[0], px[1], px[2]
+                if color is None or color == "null" or color == "":
+                    continue
+                eid = _next_id("px")
+                attrs = {"id": eid,
+                         "x": str((offset_x + x) * size),
+                         "y": str((offset_y + y) * size),
+                         "width": str(size), "height": str(size),
+                         "style": f"fill:{color}"}
+                etree.SubElement(group, f"{{{SVG_NS}}}rect", **attrs)
+                ids.append(eid)
+        self._notify()
+        return f"Drew {len(ids)} pixels" + (f" ({label})" if label else "")
+
+    # ── Grouping & Transforms ────────────────────────────────────
+
+    def create_group(self, label=None, id=None):
+        with self._lock:
+            gid = id or _next_id("group")
+            attrs = {"id": gid}
+            if label:
+                attrs[f"{{{INKSCAPE_NS}}}label"] = label
+            group = etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}g", **attrs)
+        self._notify()
+        return gid
+
+    def insert_svg(self, svg_fragment):
+        """Insert raw SVG markup."""
+        with self._lock:
+            # Wrap in SVG root for parsing
+            wrapped = f'<svg xmlns="{SVG_NS}" xmlns:inkscape="{INKSCAPE_NS}">{svg_fragment}</svg>'
+            try:
+                parsed = etree.fromstring(wrapped.encode("utf-8"))
+                ids = []
+                for child in parsed:
+                    self._get_parent().append(child)
+                    cid = child.get("id", "")
+                    if cid:
+                        ids.append(cid)
+                self._notify()
+                return f"Inserted {len(ids)} element(s)"
+            except etree.XMLSyntaxError as e:
+                return f"SVG parse error: {e}"
+
+    def delete_element(self, element_id):
+        with self._lock:
+            for elem in self.root.iter():
+                if elem.get("id") == element_id:
+                    parent = elem.getparent()
+                    if parent is not None:
+                        parent.remove(elem)
+                        self._notify()
+                        return f"Deleted {element_id}"
+            return f"Element {element_id} not found"
+
+    # ── State Query ──────────────────────────────────────────────
+
+    def get_state(self):
+        """Return a summary of the current canvas state."""
+        layers = []
+        elements = 0
+        for g in self.root.iter(f"{{{SVG_NS}}}g"):
+            if g.get(f"{{{INKSCAPE_NS}}}groupmode") == "layer":
+                label = g.get(f"{{{INKSCAPE_NS}}}label", "unnamed")
+                children = len(list(g))
+                layers.append(f"  - '{label}' ({children} elements)")
+                elements += children
+
+        for child in self.root:
+            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            cid = child.get("id", "")
+            if tag != "g" and tag != "defs":
+                elements += 1
+
+        state = f"Canvas: {self.width}x{self.height}\n"
+        if layers:
+            state += f"Layers ({len(layers)}):\n" + "\n".join(layers) + "\n"
+        state += f"Total elements: {elements}"
+        return state

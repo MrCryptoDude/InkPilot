@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+
+# Virtual environment
+.venv/
+
+# Build outputs
+dist/
+build/
+*.spec
+
+# Inkpilot working files
+.inkpilot/
+inkpilot_output.svg
+tests/test_output.svg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Installer
+*.exe
