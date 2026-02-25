@@ -538,7 +538,7 @@ def inkpilot_import_image(
         abs_path = os.path.abspath(file_path)
         eid = canvas.embed_image(abs_path, x=x, y=y, width=width, height=height, label=label)
         _save_to_disk()
-        return f"Image embedded as {eid} (linked: {abs_path}). Select it and run object-trace to vectorize."
+        return f"Image embedded as {eid}. Auto-scaled to fit canvas. Use inkpilot_read_canvas for exact bounds."
     
     # --- Mode 2: Base64 file on disk (best for Claude — avoids context bloat) ---
     # Claude writes base64 to a file via Filesystem tools, passes path here.
@@ -575,7 +575,7 @@ def inkpilot_import_image(
 
 
 def _save_and_embed_raw(raw, x, y, width, height, label, imports_dir):
-    """Shared helper: detect type, save to disk, embed in canvas."""
+    """Shared helper: detect type, save to disk, embed in canvas (as inline base64)."""
     # Detect image type from magic bytes (no imghdr — removed in Python 3.13)
     ext = "png"
     if raw[:8] == b'\x89PNG\r\n\x1a\n':
@@ -598,7 +598,7 @@ def _save_and_embed_raw(raw, x, y, width, height, label, imports_dir):
     abs_path = os.path.abspath(save_path)
     eid = canvas.embed_image(abs_path, x=x, y=y, width=width, height=height, label=label)
     _save_to_disk()
-    return f"Image embedded as {eid} (file: {abs_path}). Select it and run object-trace to vectorize."
+    return f"Image embedded as {eid}. Use inkpilot_read_canvas to get exact position/size for tracing."
 
 
 @mcp.tool()

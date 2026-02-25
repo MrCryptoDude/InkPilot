@@ -374,42 +374,127 @@ class SVGCanvas:
     # ── Image Embedding ───────────────────────────────────────────
 
     def embed_image(self, image_path, x=0, y=0, width=None, height=None, label=None):
-        """Embed a raster image (PNG/JPG/etc) into the SVG as a linked <image> element.
-        Uses absolute file path so Inkscape can find it for tracing.
-        If width/height not given, uses the canvas dimensions."""
-        from pathlib import Path
+        """Embed a raster image (PNG/JPG/etc) into the SVG as inline base64.
+        Works in both Inkscape and browser live preview.
+        If width/height not given, auto-scales to fit canvas preserving aspect ratio."""
+        import base64 as b64
+        
+        # Read file and convert to base64 data URI
+        with open(image_path, "rb") as f:
+            raw = f.read()
+        
+        # Detect mime type from magic bytes
+        mime = "image/png"  # default
+        if raw[:3] == b'\xff\xd8\xff':
+            mime = "image/jpeg"
+        elif raw[:4] == b'GIF8':
+            mime = "image/gif"
+        elif raw[:4] == b'RIFF' and len(raw) > 11 and raw[8:12] == b'WEBP':
+            mime = "image/webp"
+        
+        data_uri = f"data:{mime};base64,{b64.b64encode(raw).decode('ascii')}"
+        
+        # Auto-size: fit to canvas preserving aspect ratio
+        if width is None and height is None:
+            w, h = self._detect_image_size(raw)
+            if w and h:
+                scale = min(self.width / w, self.height / h)
+                width = w * scale
+                height = h * scale
+                # Center on canvas
+                x = (self.width - width) / 2
+                y = (self.height - height) / 2
+            else:
+                width = self.width
+                height = self.height
+        
         with self._lock:
             eid = _next_id("img")
             attrs = {
                 "id": eid,
                 "x": str(x),
                 "y": str(y),
-                "width": str(width or self.width),
-                "height": str(height or self.height),
+                "width": str(width),
+                "height": str(height),
             }
             if label:
                 attrs[f"{{{INKSCAPE_NS}}}label"] = label
 
             elem = etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}image", **attrs)
-            # Convert to file URI for cross-platform SVG compatibility
-            file_uri = Path(image_path).as_uri()  # file:///C:/path/to/img.png
-            elem.set(f"{{{XLINK_NS}}}href", file_uri)
-            elem.set("href", file_uri)
+            elem.set(f"{{{XLINK_NS}}}href", data_uri)
+            elem.set("href", data_uri)
         self._notify()
         return eid
+
+    @staticmethod
+    def _detect_image_size(raw):
+        """Detect image dimensions from raw bytes. Returns (width, height) or (None, None)."""
+        import struct
+        try:
+            # PNG: width/height at bytes 16-23
+            if raw[:8] == b'\x89PNG\r\n\x1a\n':
+                w, h = struct.unpack('>II', raw[16:24])
+                return w, h
+            # JPEG: scan for SOF markers
+            if raw[:3] == b'\xff\xd8\xff':
+                i = 2
+                while i < len(raw) - 9:
+                    if raw[i] == 0xFF:
+                        marker = raw[i + 1]
+                        if marker in (0xC0, 0xC1, 0xC2):
+                            h, w = struct.unpack('>HH', raw[i+5:i+9])
+                            return w, h
+                        elif marker == 0xD9:  # EOI
+                            break
+                        elif marker in (0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0x01, 0xFF):
+                            i += 1
+                        else:
+                            seg_len = struct.unpack('>H', raw[i+2:i+4])[0]
+                            i += 2 + seg_len
+                    else:
+                        i += 1
+            # GIF: width/height at bytes 6-9 (little-endian)
+            if raw[:4] == b'GIF8':
+                w, h = struct.unpack('<HH', raw[6:10])
+                return w, h
+        except Exception:
+            pass
+        return None, None
 
     def embed_image_base64(self, data_uri, x=0, y=0, width=None, height=None, label=None):
         """Embed a raster image from a base64 data URI into the SVG.
         data_uri should be like 'data:image/png;base64,iVBOR...' 
-        This inlines the image so no external file needed."""
+        If width/height not given, auto-scales to fit canvas preserving aspect ratio."""
+        import base64 as b64
+        
+        # Auto-size: decode to detect dimensions
+        if width is None and height is None:
+            try:
+                b64_part = data_uri.split(",", 1)[1] if "," in data_uri else data_uri
+                raw = b64.b64decode(b64_part)
+                w, h = self._detect_image_size(raw)
+                if w and h:
+                    scale = min(self.width / w, self.height / h)
+                    width = w * scale
+                    height = h * scale
+                    x = (self.width - width) / 2
+                    y = (self.height - height) / 2
+            except Exception:
+                pass
+        
+        if width is None:
+            width = self.width
+        if height is None:
+            height = self.height
+        
         with self._lock:
             eid = _next_id("img")
             attrs = {
                 "id": eid,
                 "x": str(x),
                 "y": str(y),
-                "width": str(width or self.width),
-                "height": str(height or self.height),
+                "width": str(width),
+                "height": str(height),
             }
             if label:
                 attrs[f"{{{INKSCAPE_NS}}}label"] = label
