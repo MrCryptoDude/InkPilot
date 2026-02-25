@@ -19,13 +19,14 @@ class LiveServer:
     Serves the live preview page and pushes SVG updates via SSE.
     """
 
-    def __init__(self, canvas, port=DEFAULT_PORT):
+    def __init__(self, canvas, port=DEFAULT_PORT, open_inkscape_fn=None):
         self.canvas = canvas
         self.port = port
         self.clients = []
         self._lock = threading.Lock()
         self._server = None
         self._thread = None
+        self.open_inkscape_fn = open_inkscape_fn
 
         canvas.on_change(self._on_canvas_change)
 
@@ -90,30 +91,19 @@ class LiveServer:
             def _handle_open_inkscape(self):
                 """Open current canvas in Inkscape (triggered from browser button)."""
                 try:
-                    from .inkscape import open_in_inkscape
-                    home = os.environ.get("USERPROFILE", "") or os.environ.get("HOME", "") or os.path.expanduser("~")
-                    svg_path = os.path.join(home, ".inkpilot", "canvas.svg")
-                    result = open_in_inkscape(svg_path)
+                    if server_ref.open_inkscape_fn:
+                        result = server_ref.open_inkscape_fn()
+                    else:
+                        result = "No open_inkscape function configured"
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(json.dumps({"result": result}).encode())
                 except Exception as e:
-                    # Try absolute import if relative fails
-                    try:
-                        from inkpilot_mcp.inkscape import open_in_inkscape
-                        home = os.environ.get("USERPROFILE", "") or os.environ.get("HOME", "") or os.path.expanduser("~")
-                        svg_path = os.path.join(home, ".inkpilot", "canvas.svg")
-                        result = open_in_inkscape(svg_path)
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"result": result}).encode())
-                    except Exception as e2:
-                        self.send_response(500)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": str(e2)}).encode())
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
 
             def _serve_file(self, filename, content_type):
                 filepath = VIEWER_DIR / filename

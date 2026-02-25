@@ -49,7 +49,14 @@ def _load_config():
 # ── State ────────────────────────────────────────────────────────
 
 canvas = SVGCanvas(512, 512)
-live = LiveServer(canvas, port=7878)
+
+def _open_inkscape_callback():
+    """Callback for live preview's 'Open in Inkscape' button."""
+    from .inkscape import open_in_inkscape as _open
+    _do_save()  # Ensure file is on disk
+    return _open(WORK_FILE)
+
+live = LiveServer(canvas, port=7878, open_inkscape_fn=_open_inkscape_callback)
 mcp = FastMCP("inkpilot")
 _live_started = False
 
@@ -119,6 +126,10 @@ def inkpilot_setup_canvas(width: int = 512, height: int = 512) -> str:
     live_msg = _ensure_live_server()
     if live_msg:
         result += f"\n{live_msg}"
+    
+    # Auto-open Inkscape (singleton — won't open duplicates)
+    ink_msg = open_in_inkscape(WORK_FILE)
+    result += f"\n{ink_msg}"
     result += f"\nWorking file: {WORK_FILE}"
     return result
 
