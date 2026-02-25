@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .canvas import SVGCanvas
 from .live_server import LiveServer
-from .inkscape import open_in_inkscape, find_inkscape
+from .inkscape import open_in_inkscape, find_inkscape, run_inkscape_actions
 
 # ── Paths ────────────────────────────────────────────────────────
 
@@ -186,11 +186,19 @@ def inkpilot_draw_circle(
 @mcp.tool()
 def inkpilot_draw_path(
     d: str, fill: str = "none", stroke: str = "#ffffff",
-    stroke_width: float = 1, label: str = None,
+    stroke_width: float = 1, opacity: float = None,
+    filter_id: str = None, clip_path_id: str = None,
+    label: str = None,
 ) -> str:
     """Draw an SVG path. For complex shapes, curves, outlines.
-    d = SVG path data (M, L, C, A, Z commands)."""
+    d = SVG path data (M, L, C, Q, A, Z commands). Use C for smooth cubic bezier curves.
+    fill can be a color (#hex) or a gradient reference 'url(#gradient_id)'.
+    filter_id = ID of a filter added with add_filter (for blur/shadow).
+    clip_path_id = ID of a clip path added with add_clip_path."""
     kwargs = {"d": d, "fill": fill, "stroke": stroke, "stroke_width": stroke_width}
+    if opacity is not None: kwargs["opacity"] = opacity
+    if filter_id: kwargs["filter_id"] = filter_id
+    if clip_path_id: kwargs["clip_path_id"] = clip_path_id
     if label: kwargs["label"] = label
     eid = canvas.draw_path(**kwargs)
     _save_to_disk()
@@ -217,6 +225,199 @@ def inkpilot_draw_polygon(points: str, fill: str = "#ffffff", stroke: str = None
     eid = canvas.draw_polygon(**kwargs)
     _save_to_disk()
     return f"Polygon {eid}"
+
+
+@mcp.tool()
+def inkpilot_add_gradient(
+    gradient_id: str,
+    colors: list,
+    x1: str = "0%", y1: str = "0%",
+    x2: str = "0%", y2: str = "100%",
+    gradient_type: str = "linear",
+) -> str:
+    """Add a gradient to defs for use as fill='url(#gradient_id)'.
+    colors = list of [offset, color] pairs, e.g. [["0%", "#8B5E3C"], ["100%", "#5C3D2E"]].
+    gradient_type = 'linear' or 'radial'.
+    For radial: x1=cx, y1=cy, x2=r (radius)."""
+    tuples = [(c[0], c[1]) for c in colors]
+    result = canvas.add_gradient(gradient_id, tuples, x1, y1, x2, y2, gradient_type)
+    _save_to_disk()
+    return f"Gradient '{result}' added. Use fill='url(#{result})'"
+
+
+@mcp.tool()
+def inkpilot_add_filter(
+    filter_id: str,
+    blur_std: float = None,
+    shadow_dx: float = None,
+    shadow_dy: float = None,
+    shadow_blur: float = None,
+    shadow_color: str = None,
+) -> str:
+    """Add a filter (blur, drop shadow) to defs for use as filter='url(#filter_id)'.
+    For blur only: set blur_std (e.g. 2.0).
+    For drop shadow: set shadow_dx, shadow_dy, shadow_blur, shadow_color.
+    Can combine both."""
+    result = canvas.add_filter(filter_id, blur_std, shadow_dx, shadow_dy, shadow_blur, shadow_color)
+    _save_to_disk()
+    return f"Filter '{result}' added. Apply with filter='url(#{result})'"
+
+
+@mcp.tool()
+def inkpilot_add_clip_path(clip_id: str, shape_d: str) -> str:
+    """Add a clip path to defs. shape_d is an SVG path 'd' string.
+    Apply to elements via clip-path='url(#clip_id)' in style."""
+    result = canvas.add_clip_path(clip_id, shape_d)
+    _save_to_disk()
+    return f"Clip path '{result}' added"
+
+
+@mcp.tool()
+def inkpilot_inkscape_action(actions: str, select_ids: list = None) -> str:
+    """Run Inkscape's native engine on the canvas. This is POWERFUL.
+    
+    Workflow: select elements by ID, then apply operations.
+    
+    actions: semicolon-separated Inkscape action commands.
+    select_ids: optional list of element IDs to pre-select (convenience shortcut).
+    
+    BOOLEAN OPERATIONS (select 2+ paths first):
+      path-union          - Merge selected paths into one
+      path-difference     - Bottom minus top
+      path-intersection   - Keep only overlapping area
+      path-exclusion      - XOR (parts belonging to only one path)
+      path-combine        - Combine into compound path
+      path-break-apart    - Break compound path into subpaths
+      path-flatten        - Flatten overlapping objects into visible parts
+      path-fracture       - Fracture into all possible segments
+      path-simplify       - Remove extra nodes (smooth/simplify)
+      path-cut            - Cut bottom path's stroke into pieces
+      path-division       - Cut bottom path into pieces
+    
+    OBJECT OPERATIONS:
+      object-to-path                - Convert shapes to paths
+      object-stroke-to-path         - Convert strokes to filled paths
+      object-align:left page        - Align (left|hcenter|right|top|vcenter|bottom) (page|drawing|selection)
+      object-distribute:hgap        - Distribute (hgap|vgap|left|right|top|bottom)
+      object-flip-horizontal        - Flip horizontally
+      object-flip-vertical          - Flip vertically
+      object-set-attribute:attr,val - Set SVG attribute
+      object-set-clip               - Use topmost as clipping path
+      object-set-mask               - Use topmost as mask
+      object-trace                  - Bitmap trace
+    
+    TRANSFORMS:
+      transform-rotate:45           - Rotate by degrees
+      transform-scale:1.5           - Scale by factor
+      transform-translate:10,20     - Move by dx,dy
+    
+    SELECTION:
+      select-by-id:id1,id2          - Select specific elements
+      select-all                    - Select everything
+      select-clear                  - Deselect all
+    
+    STACKING:
+      selection-group               - Group selected
+      selection-ungroup             - Ungroup selected
+      selection-top                 - Raise to top
+      selection-bottom              - Lower to bottom
+    
+    FILTERS (200+ artistic effects, e.g.):
+      org.inkscape.effect.filter.Blur          - Blur
+      org.inkscape.effect.filter.f038          - Neon light
+      org.inkscape.effect.filter.f020          - Oil painting
+      org.inkscape.effect.filter.f223          - Bright chrome
+      org.inkscape.effect.filter.f114          - 3D marble texture
+      org.inkscape.effect.filter.crosssmooth   - Smooth edges
+    
+    EXPORT (usually auto-appended):
+      export-filename:path  - Set output path
+      export-type:svg       - Set format (svg, png, pdf)
+      export-dpi:300        - Set resolution
+      export-do             - Execute export
+    
+    Example: Merge two circles into one shape:
+      select_ids=["circle_001", "circle_002"], actions="path-union"
+    
+    Example: Simplify a complex path:
+      select_ids=["path_005"], actions="path-simplify"
+    
+    Example: Align all objects to center of page:
+      actions="select-all;object-align:hcenter vcenter page"
+    """
+    # Save current canvas to disk first
+    _save_to_disk()
+    
+    # Build the full action string
+    action_parts = []
+    
+    # Pre-select elements if IDs provided
+    if select_ids:
+        ids_str = ",".join(select_ids)
+        action_parts.append(f"select-by-id:{ids_str}")
+    
+    # Add the user's actions
+    action_parts.append(actions.strip(";"))
+    
+    full_actions = ";".join(action_parts)
+    
+    # Run Inkscape CLI
+    success, message = run_inkscape_actions(WORK_FILE, full_actions)
+    
+    if success:
+        # Reload the modified SVG back into canvas
+        reload_msg = canvas.reload_from_file(WORK_FILE)
+        return f"Inkscape action completed.\n{message}\n{reload_msg}"
+    else:
+        return f"Inkscape action failed: {message}"
+
+
+@mcp.tool()
+def inkpilot_export_png(
+    filename: str = None,
+    dpi: int = 96,
+    width: int = None,
+    height: int = None,
+    element_id: str = None,
+) -> str:
+    """Export the canvas (or a specific element) as PNG.
+    
+    filename: output name (saved to ~/.inkpilot/output/). Defaults to timestamped name.
+    dpi: resolution (96 for screen, 300 for print).
+    width/height: pixel dimensions (overrides dpi if set).
+    element_id: export only this element (None = full page).
+    """
+    _save_to_disk()
+    
+    if not filename:
+        filename = f"inkpilot_{int(time.time())}.png"
+    if not filename.endswith(".png"):
+        filename += ".png"
+    
+    out_path = os.path.join(OUTPUT_DIR, filename)
+    
+    action_parts = []
+    if element_id:
+        action_parts.append(f"export-id:{element_id}")
+        action_parts.append("export-id-only")
+    else:
+        action_parts.append("export-area-page")
+    
+    action_parts.append(f"export-filename:{out_path}")
+    action_parts.append(f"export-dpi:{dpi}")
+    if width:
+        action_parts.append(f"export-width:{width}")
+    if height:
+        action_parts.append(f"export-height:{height}")
+    action_parts.append("export-do")
+    
+    actions_str = ";".join(action_parts)
+    success, message = run_inkscape_actions(WORK_FILE, actions_str)
+    
+    if success:
+        return f"Exported PNG: {out_path}\n{message}"
+    else:
+        return f"PNG export failed: {message}"
 
 
 @mcp.tool()

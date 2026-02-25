@@ -105,6 +105,29 @@ class SVGCanvas:
         self._notify()
         return f"Canvas set to {width}x{height}"
 
+    def reload_from_file(self, path):
+        """Reload the canvas from an SVG file (after Inkscape modifies it)."""
+        with self._lock:
+            try:
+                tree = etree.parse(path)
+                new_root = tree.getroot()
+                # Preserve our namespace map
+                self.root = new_root
+                # Update dimensions from the file
+                w = new_root.get("width", str(self.width))
+                h = new_root.get("height", str(self.height))
+                try:
+                    self.width = int(float(w.replace("px", "").replace("mm", "")))
+                    self.height = int(float(h.replace("px", "").replace("mm", "")))
+                except (ValueError, TypeError):
+                    pass
+                # Reset active layer (layer references are now stale)
+                self.active_layer = None
+            except Exception as e:
+                return f"Reload error: {e}"
+        self._notify()
+        return f"Reloaded canvas from {path}"
+
     def clear(self):
         with self._lock:
             # Remove everything except defs
@@ -220,10 +243,18 @@ class SVGCanvas:
         self._notify()
         return eid
 
-    def draw_path(self, d, fill="none", stroke="#ffffff", stroke_width=1, id=None, label=None):
+    def draw_path(self, d, fill="none", stroke="#ffffff", stroke_width=1,
+                  opacity=None, filter_id=None, clip_path_id=None,
+                  id=None, label=None):
         with self._lock:
             eid = id or _next_id("path")
             style = f"fill:{fill};stroke:{stroke};stroke-width:{stroke_width}"
+            if opacity is not None:
+                style += f";opacity:{opacity}"
+            if filter_id:
+                style += f";filter:url(#{filter_id})"
+            if clip_path_id:
+                style += f";clip-path:url(#{clip_path_id})"
             attrs = {"id": eid, "d": d, "style": style}
             if label:
                 attrs[f"{{{INKSCAPE_NS}}}label"] = label
@@ -315,6 +346,111 @@ class SVGCanvas:
                 ids.append(eid)
         self._notify()
         return f"Drew {len(ids)} pixels" + (f" ({label})" if label else "")
+
+    # ── Advanced SVG Features ────────────────────────────────────
+
+    def add_gradient(self, gradient_id, colors, x1="0%", y1="0%", x2="0%", y2="100%", gradient_type="linear"):
+        """
+        Add a gradient to defs. Returns the gradient ID for use as fill="url(#id)".
+        colors: list of (offset, color) tuples, e.g. [("0%", "#ff0000"), ("100%", "#0000ff")]
+        gradient_type: 'linear' or 'radial'
+        """
+        with self._lock:
+            defs = self.root.find(f"{{{SVG_NS}}}defs")
+            if defs is None:
+                defs = etree.SubElement(self.root, f"{{{SVG_NS}}}defs")
+                self.root.insert(0, defs)
+
+            if gradient_type == "radial":
+                grad = etree.SubElement(defs, f"{{{SVG_NS}}}radialGradient", id=gradient_id)
+                grad.set("cx", x1); grad.set("cy", y1)
+                grad.set("r", x2)  # reuse x2 as radius
+            else:
+                grad = etree.SubElement(defs, f"{{{SVG_NS}}}linearGradient", id=gradient_id)
+                grad.set("x1", x1); grad.set("y1", y1)
+                grad.set("x2", x2); grad.set("y2", y2)
+
+            for offset, color in colors:
+                stop = etree.SubElement(grad, f"{{{SVG_NS}}}stop")
+                stop.set("offset", str(offset))
+                # Handle opacity in color
+                if len(color) > 7:  # e.g. #ff000080
+                    stop.set("style", f"stop-color:{color[:7]};stop-opacity:{int(color[7:9], 16)/255:.2f}")
+                else:
+                    stop.set("style", f"stop-color:{color};stop-opacity:1")
+
+        self._notify()
+        return gradient_id
+
+    def add_filter(self, filter_id, blur_std=None, shadow_dx=None, shadow_dy=None,
+                   shadow_blur=None, shadow_color=None):
+        """
+        Add a filter to defs. Returns filter ID for use as filter="url(#id)".
+        Supports gaussian blur and drop shadow.
+        """
+        with self._lock:
+            defs = self.root.find(f"{{{SVG_NS}}}defs")
+            if defs is None:
+                defs = etree.SubElement(self.root, f"{{{SVG_NS}}}defs")
+                self.root.insert(0, defs)
+
+            filt = etree.SubElement(defs, f"{{{SVG_NS}}}filter", id=filter_id)
+            filt.set("x", "-20%"); filt.set("y", "-20%")
+            filt.set("width", "140%"); filt.set("height", "140%")
+
+            if blur_std is not None:
+                blur = etree.SubElement(filt, f"{{{SVG_NS}}}feGaussianBlur")
+                blur.set("in", "SourceGraphic")
+                blur.set("stdDeviation", str(blur_std))
+                if shadow_dx is None:
+                    blur.set("result", "blur")
+
+            if shadow_dx is not None:
+                # Drop shadow: blur → offset → merge with original
+                blur_s = etree.SubElement(filt, f"{{{SVG_NS}}}feGaussianBlur")
+                blur_s.set("in", "SourceAlpha")
+                blur_s.set("stdDeviation", str(shadow_blur or 3))
+                blur_s.set("result", "shadow_blur")
+
+                offset = etree.SubElement(filt, f"{{{SVG_NS}}}feOffset")
+                offset.set("in", "shadow_blur")
+                offset.set("dx", str(shadow_dx or 2))
+                offset.set("dy", str(shadow_dy or 2))
+                offset.set("result", "shadow_offset")
+
+                if shadow_color:
+                    flood = etree.SubElement(filt, f"{{{SVG_NS}}}feFlood")
+                    flood.set("flood-color", shadow_color)
+                    flood.set("flood-opacity", "0.5")
+                    flood.set("result", "shadow_color")
+                    comp = etree.SubElement(filt, f"{{{SVG_NS}}}feComposite")
+                    comp.set("in", "shadow_color"); comp.set("in2", "shadow_offset")
+                    comp.set("operator", "in"); comp.set("result", "colored_shadow")
+                    merge = etree.SubElement(filt, f"{{{SVG_NS}}}feMerge")
+                    etree.SubElement(merge, f"{{{SVG_NS}}}feMergeNode").set("in", "colored_shadow")
+                    etree.SubElement(merge, f"{{{SVG_NS}}}feMergeNode").set("in", "SourceGraphic")
+                else:
+                    merge = etree.SubElement(filt, f"{{{SVG_NS}}}feMerge")
+                    etree.SubElement(merge, f"{{{SVG_NS}}}feMergeNode").set("in", "shadow_offset")
+                    etree.SubElement(merge, f"{{{SVG_NS}}}feMergeNode").set("in", "SourceGraphic")
+
+        self._notify()
+        return filter_id
+
+    def add_clip_path(self, clip_id, shape_d):
+        """Add a clip path to defs. shape_d is an SVG path 'd' attribute."""
+        with self._lock:
+            defs = self.root.find(f"{{{SVG_NS}}}defs")
+            if defs is None:
+                defs = etree.SubElement(self.root, f"{{{SVG_NS}}}defs")
+                self.root.insert(0, defs)
+
+            clip = etree.SubElement(defs, f"{{{SVG_NS}}}clipPath", id=clip_id)
+            path = etree.SubElement(clip, f"{{{SVG_NS}}}path")
+            path.set("d", shape_d)
+
+        self._notify()
+        return clip_id
 
     # ── Grouping & Transforms ────────────────────────────────────
 

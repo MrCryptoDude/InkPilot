@@ -88,6 +88,56 @@ def find_inkscape():
     return None
 
 
+def run_inkscape_actions(svg_path, actions_str, output_path=None):
+    """Run Inkscape CLI actions on an SVG file.
+    
+    actions_str: semicolon-separated action commands, e.g.
+      "select-by-id:rect_001,rect_002;path-union;export-filename:/path/out.svg;export-overwrite;export-plain-svg;export-do;"
+    
+    If output_path is None, modifies the file in-place.
+    Returns (success: bool, message: str)
+    """
+    exe = find_inkscape()
+    if not exe:
+        return False, "Inkscape not found"
+    
+    out = output_path or svg_path
+    
+    # Build the full action string with export at the end
+    # If the user already included export commands, use as-is
+    if "export-do" not in actions_str:
+        # Append export commands to save the result
+        actions_str = actions_str.rstrip(";")
+        actions_str += f";export-filename:{out};export-overwrite;export-plain-svg;export-do;"
+    
+    cmd = [
+        exe,
+        svg_path,
+        "--batch-process",
+        f"--actions={actions_str}",
+    ]
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True, text=True, timeout=30,
+            creationflags=_NO_WINDOW,
+        )
+        
+        # Inkscape outputs status to stderr
+        stderr = result.stderr.strip() if result.stderr else ""
+        stdout = result.stdout.strip() if result.stdout else ""
+        
+        if result.returncode == 0:
+            return True, f"Actions completed. {stderr}"
+        else:
+            return False, f"Inkscape error (code {result.returncode}): {stderr or stdout}"
+    except subprocess.TimeoutExpired:
+        return False, "Inkscape action timed out (30s limit)"
+    except Exception as e:
+        return False, f"Error running Inkscape: {e}"
+
+
 def open_in_inkscape(svg_path):
     """Open an SVG file in Inkscape (one time, for editing the final result)."""
     exe = find_inkscape()
