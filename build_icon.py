@@ -13,9 +13,8 @@ except ImportError:
     from PIL import Image
 
 PROJECT_DIR = Path(__file__).parent.resolve()
-HOME = Path(os.environ.get("USERPROFILE", os.path.expanduser("~")))
-ICON_SVG = HOME / ".inkpilot" / "output" / "inkpilot_icon.svg"
 ASSETS_DIR = PROJECT_DIR / "assets"
+ICON_SVG = ASSETS_DIR / "inkpilot_icon.svg"
 ASSETS_DIR.mkdir(exist_ok=True)
 
 SIZES = [16, 32, 48, 64, 128, 256]
