@@ -371,6 +371,55 @@ class SVGCanvas:
         self._notify()
         return f"Drew {len(ids)} pixels" + (f" ({label})" if label else "")
 
+    # ── Image Embedding ───────────────────────────────────────────
+
+    def embed_image(self, image_path, x=0, y=0, width=None, height=None, label=None):
+        """Embed a raster image (PNG/JPG/etc) into the SVG as a linked <image> element.
+        Uses absolute file path so Inkscape can find it for tracing.
+        If width/height not given, uses the canvas dimensions."""
+        from pathlib import Path
+        with self._lock:
+            eid = _next_id("img")
+            attrs = {
+                "id": eid,
+                "x": str(x),
+                "y": str(y),
+                "width": str(width or self.width),
+                "height": str(height or self.height),
+            }
+            if label:
+                attrs[f"{{{INKSCAPE_NS}}}label"] = label
+
+            elem = etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}image", **attrs)
+            # Convert to file URI for cross-platform SVG compatibility
+            file_uri = Path(image_path).as_uri()  # file:///C:/path/to/img.png
+            elem.set(f"{{{XLINK_NS}}}href", file_uri)
+            elem.set("href", file_uri)
+        self._notify()
+        return eid
+
+    def embed_image_base64(self, data_uri, x=0, y=0, width=None, height=None, label=None):
+        """Embed a raster image from a base64 data URI into the SVG.
+        data_uri should be like 'data:image/png;base64,iVBOR...' 
+        This inlines the image so no external file needed."""
+        with self._lock:
+            eid = _next_id("img")
+            attrs = {
+                "id": eid,
+                "x": str(x),
+                "y": str(y),
+                "width": str(width or self.width),
+                "height": str(height or self.height),
+            }
+            if label:
+                attrs[f"{{{INKSCAPE_NS}}}label"] = label
+
+            elem = etree.SubElement(self._get_parent(), f"{{{SVG_NS}}}image", **attrs)
+            elem.set(f"{{{XLINK_NS}}}href", data_uri)
+            elem.set("href", data_uri)
+        self._notify()
+        return eid
+
     # ── Advanced SVG Features ────────────────────────────────────
 
     def add_gradient(self, gradient_id, colors, x1="0%", y1="0%", x2="0%", y2="100%", gradient_type="linear"):
@@ -581,6 +630,12 @@ class SVGCanvas:
             elif tag == "polygon":
                 pts = elem.get("points", "")
                 info += f" points='{pts[:60]}{'...' if len(pts) > 60 else ''}'"
+            elif tag == "image":
+                href = elem.get(f"{{{XLINK_NS}}}href", elem.get("href", ""))
+                if href.startswith("data:"):
+                    info += f" x={elem.get('x')} y={elem.get('y')} w={elem.get('width')} h={elem.get('height')} [INLINE BASE64]"
+                else:
+                    info += f" x={elem.get('x')} y={elem.get('y')} w={elem.get('width')} h={elem.get('height')} src='{href}'"
             elif tag == "g":
                 groupmode = elem.get(f"{{{INKSCAPE_NS}}}groupmode", "")
                 if groupmode == "layer":

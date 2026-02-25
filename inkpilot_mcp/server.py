@@ -481,6 +481,83 @@ def inkpilot_export_png(
 
 
 @mcp.tool()
+def inkpilot_import_image(
+    file_path: str = None,
+    base64_data: str = None,
+    x: float = 0,
+    y: float = 0,
+    width: float = None,
+    height: float = None,
+    label: str = None,
+) -> str:
+    """Import a raster image (PNG/JPG/WEBP/etc) onto the canvas.
+    
+    Two input modes:
+      file_path  — absolute path to an image on disk (preferred for tracing)
+      base64_data — raw base64 string (NO data URI prefix). The tool adds it.
+    
+    After importing, you can:
+      1. Use inkpilot_inkscape_action with select_ids=[image_id] and
+         actions="object-trace" to auto-trace it into vector paths.
+      2. Draw on top of it as a reference layer, then delete it.
+    
+    Workflow for reproducing a user's uploaded image:
+      1. Call inkpilot_import_image with the image
+      2. Select it and run object-trace to vectorize
+      3. Refine the traced paths with path-simplify, manual edits, etc.
+    """
+    import base64 as b64
+    
+    IMPORTS_DIR = os.path.join(WORK_DIR, "imports")
+    os.makedirs(IMPORTS_DIR, exist_ok=True)
+    
+    if file_path and os.path.isfile(file_path):
+        # Use the file directly — Inkscape can read it for tracing
+        abs_path = os.path.abspath(file_path)
+        eid = canvas.embed_image(abs_path, x=x, y=y, width=width, height=height, label=label)
+        _save_to_disk()
+        return f"Image embedded as {eid} (linked: {abs_path}). Select it and run object-trace to vectorize."
+    
+    elif base64_data:
+        # Decode base64, save to disk, then link
+        try:
+            # Strip data URI prefix if accidentally included
+            if base64_data.startswith("data:"):
+                base64_data = base64_data.split(",", 1)[1]
+            
+            raw = b64.b64decode(base64_data)
+        except Exception as e:
+            return f"Failed to decode base64: {e}"
+        
+        # Detect image type from magic bytes (no imghdr — removed in Python 3.13)
+        ext = "png"  # default
+        if raw[:8] == b'\x89PNG\r\n\x1a\n':
+            ext = "png"
+        elif raw[:3] == b'\xff\xd8\xff':
+            ext = "jpg"
+        elif raw[:4] == b'GIF8':
+            ext = "gif"
+        elif raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
+            ext = "webp"
+        elif raw[:2] == b'BM':
+            ext = "bmp"
+        
+        filename = f"import_{int(time.time())}.{ext}"
+        save_path = os.path.join(IMPORTS_DIR, filename)
+        
+        with open(save_path, "wb") as f:
+            f.write(raw)
+        
+        abs_path = os.path.abspath(save_path)
+        eid = canvas.embed_image(abs_path, x=x, y=y, width=width, height=height, label=label)
+        _save_to_disk()
+        return f"Image saved and embedded as {eid} (file: {abs_path}). Select it and run object-trace to vectorize."
+    
+    else:
+        return "Error: Provide either file_path or base64_data."
+
+
+@mcp.tool()
 def inkpilot_insert_svg(svg: str) -> str:
     """Insert raw SVG markup. No outer <svg> tags — just inner elements.
     For complex elements not covered by other tools."""
