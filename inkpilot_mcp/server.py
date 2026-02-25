@@ -54,7 +54,7 @@ def _open_inkscape_callback():
     """Callback for live preview's 'Open in Inkscape' button."""
     from .inkscape import open_in_inkscape as _open
     _do_save()  # Ensure file is on disk
-    return _open(WORK_FILE)
+    return _open(WORK_FILE, force_reload=True)
 
 live = LiveServer(canvas, port=7878, open_inkscape_fn=_open_inkscape_callback)
 mcp = FastMCP("inkpilot")
@@ -636,7 +636,7 @@ def inkpilot_refresh_inkscape() -> str:
     """Reopen the current canvas in Inkscape to see latest changes.
     Call this after a batch of drawing operations so the user sees the update."""
     _save_to_disk_now()
-    return open_in_inkscape(WORK_FILE)
+    return open_in_inkscape(WORK_FILE, force_reload=True)
 
 
 @mcp.tool()

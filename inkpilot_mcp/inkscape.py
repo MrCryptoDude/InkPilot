@@ -158,8 +158,8 @@ def _is_inkscape_running():
     return True
 
 
-def open_in_inkscape(svg_path):
-    """Open SVG in Inkscape. Reuses existing window if already open."""
+def open_in_inkscape(svg_path, force_reload=False):
+    """Open SVG in Inkscape. Reuses existing window unless force_reload=True."""
     global _inkscape_proc
     exe = find_inkscape()
     if not exe:
@@ -167,7 +167,18 @@ def open_in_inkscape(svg_path):
     
     with _inkscape_lock:
         if _is_inkscape_running():
-            return "Inkscape already open (file auto-saves to same path)"
+            if not force_reload:
+                return "Inkscape already open (file auto-saves to same path)"
+            # Kill existing process so we can reopen with updated file
+            try:
+                _inkscape_proc.terminate()
+                _inkscape_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    _inkscape_proc.kill()
+                except Exception:
+                    pass
+            _inkscape_proc = None
         
         try:
             if sys.platform == "win32":
@@ -177,6 +188,6 @@ def open_in_inkscape(svg_path):
                 )
             else:
                 _inkscape_proc = subprocess.Popen([exe, svg_path], start_new_session=True)
-            return "Opened in Inkscape"
+            return "Opened in Inkscape" + (" (reloaded)" if force_reload else "")
         except Exception as e:
             return f"Error: {e}"
