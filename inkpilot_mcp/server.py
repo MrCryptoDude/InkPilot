@@ -122,7 +122,14 @@ def inkpilot_setup_canvas(width: int = 512, height: int = 512) -> str:
     
     WORKFLOW: Draw shapes (circles, rects, paths) → use inkpilot_inkscape_action for
     boolean ops (union, difference), smoothing, alignment, and 200+ filters.
-    Use inkpilot_read_canvas frequently to inspect your work and make corrections."""
+    Use inkpilot_read_canvas frequently to inspect your work and make corrections.
+    
+    SPEED RULES:
+    - When user uploads an image to reproduce: LOOK at it and START DRAWING immediately
+      with shape tools (paths, circles, rects). Do NOT waste time on import/trace for
+      sketches or simple art. Just analyze visually and draw.
+    - Only use inkpilot_import_image when exact bitmap reproduction is needed.
+    - Never "strategize" or "plan" in multiple messages. Just execute."""
     canvas.clear()
     result = canvas.set_canvas(width, height)
     _save_to_disk_now()
@@ -493,19 +500,22 @@ def inkpilot_import_image(
 ) -> str:
     """Import a raster image (PNG/JPG/WEBP/etc) onto the canvas.
     
-    Two input modes:
-      file_path  — absolute path to an image on disk (preferred for tracing)
+    Three input modes:
+      file_path  — absolute path to an image on disk (FASTEST — preferred for tracing)
+      base64_file — path to a text file containing base64 data (avoids context bloat)
       base64_data — raw base64 string (NO data URI prefix). The tool adds it.
     
-    After importing, you can:
-      1. Use inkpilot_inkscape_action with select_ids=[image_id] and
-         actions="object-trace" to auto-trace it into vector paths.
-      2. Draw on top of it as a reference layer, then delete it.
+    SPEED: For most sketches/drawings, DON'T use this tool. Instead, visually
+    analyze the image and draw with shape tools (paths, circles, rects).
+    Only use this for exact bitmap reproduction or tracing.
     
-    Workflow for reproducing a user's uploaded image:
-      1. Call inkpilot_import_image with the image
-      2. Select it and run object-trace to vectorize
-      3. Refine the traced paths with path-simplify, manual edits, etc.
+    FAST PIPELINE (2 calls max for uploaded images):
+      1. bash: base64 -w0 /mnt/user-data/uploads/image.png  (get base64)
+      2. inkpilot_import_image(base64_data=<output>)         (import + embed)
+      Do NOT check sizes, strategize, or add intermediate steps.
+    
+    After importing, trace with:
+      inkpilot_inkscape_action(select_ids=[image_id], actions="object-trace")
     """
     import base64 as b64
     
