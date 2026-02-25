@@ -118,7 +118,11 @@ def _do_save():
 def inkpilot_setup_canvas(width: int = 512, height: int = 512) -> str:
     """ALWAYS call this first. Sets up the canvas and opens Inkscape with the working file.
     For a 32x32 sprite at pixel size 8, use width=256, height=256.
-    For a 16x16 sprite at pixel size 16, use width=256, height=256."""
+    For a 16x16 sprite at pixel size 16, use width=256, height=256.
+    
+    WORKFLOW: Draw shapes (circles, rects, paths) → use inkpilot_inkscape_action for
+    boolean ops (union, difference), smoothing, alignment, and 200+ filters.
+    Use inkpilot_read_canvas frequently to inspect your work and make corrections."""
     canvas.clear()
     result = canvas.set_canvas(width, height)
     _save_to_disk_now()
@@ -160,7 +164,7 @@ def inkpilot_draw_pixel_region(
     offset_y: int = 0,
     label: str = None,
 ) -> str:
-    """PRIMARY pixel art tool. Draw a batch of pixels as a group.
+    """Draw a batch of pixels as a group. Best for pixel art style graphics.
     Each pixel: [x, y, "#hexcolor"]. Null color = transparent (skip).
     
     size = pixel size in SVG units. size=8 means each logical pixel is 8x8 SVG units.
@@ -497,6 +501,24 @@ def inkpilot_delete(element_id: str) -> str:
 def inkpilot_get_state() -> str:
     """Get canvas state: size, layers, element count. Call this to see what exists."""
     return canvas.get_state() + f"\nFile: {WORK_FILE}"
+
+
+@mcp.tool()
+def inkpilot_read_canvas() -> str:
+    """Read detailed info about every element on the canvas.
+    Returns positions, sizes, colors, path data, and styles for ALL elements.
+    
+    USE THIS to inspect your work after drawing. Essential for:
+    - Checking if shapes are positioned correctly
+    - Verifying colors and styles
+    - Finding element IDs for Inkscape actions
+    - Comparing your output to a reference
+    - Debugging layout issues
+    
+    Call this FREQUENTLY to see what you've drawn and make corrections."""
+    state = canvas.get_state()
+    details = canvas.get_elements_detail()
+    return f"{state}\n\nElements:\n{details}"
 
 
 @mcp.tool()

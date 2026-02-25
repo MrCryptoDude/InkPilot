@@ -108,10 +108,14 @@ class SVGCanvas:
     def reload_from_file(self, path):
         """Reload the canvas from an SVG file (after Inkscape modifies it)."""
         with self._lock:
+            # Remember which layer was active
+            old_layer_label = None
+            if self.active_layer is not None:
+                old_layer_label = self.active_layer.get(f"{{{INKSCAPE_NS}}}label")
+
             try:
                 tree = etree.parse(path)
                 new_root = tree.getroot()
-                # Preserve our namespace map
                 self.root = new_root
                 # Update dimensions from the file
                 w = new_root.get("width", str(self.width))
@@ -121,12 +125,32 @@ class SVGCanvas:
                     self.height = int(float(h.replace("px", "").replace("mm", "")))
                 except (ValueError, TypeError):
                     pass
-                # Reset active layer (layer references are now stale)
+
+                # Restore active layer by label (references are stale, re-find)
                 self.active_layer = None
+                if old_layer_label:
+                    self.active_layer = self._find_layer(old_layer_label)
+
+                # Sync ID counter to avoid collisions with Inkscape-generated IDs
+                max_id = 0
+                for elem in self.root.iter():
+                    eid = elem.get("id", "")
+                    # Parse numeric suffix from IDs like "path_0042" or "rect_0007"
+                    parts = eid.rsplit("_", 1)
+                    if len(parts) == 2:
+                        try:
+                            max_id = max(max_id, int(parts[1]))
+                        except ValueError:
+                            pass
+                global _counter
+                if max_id >= _counter:
+                    _counter = max_id + 1
+
             except Exception as e:
                 return f"Reload error: {e}"
         self._notify()
-        return f"Reloaded canvas from {path}"
+        layer_status = f" (layer: {old_layer_label})" if old_layer_label and self.active_layer else ""
+        return f"Reloaded canvas{layer_status}"
 
     def clear(self):
         with self._lock:
@@ -284,7 +308,7 @@ class SVGCanvas:
         self._notify()
         return eid
 
-    # ── Pixel Art (the star of the show) ─────────────────────────
+    # ── Pixel Art ────────────────────────────────────────────────
 
     def draw_pixel(self, x, y, color, size=8):
         """Draw a single pixel. For live drawing effect."""
@@ -512,8 +536,61 @@ class SVGCanvas:
             if tag != "g" and tag != "defs":
                 elements += 1
 
+        active = None
+        if self.active_layer is not None:
+            active = self.active_layer.get(f"{{{INKSCAPE_NS}}}label", "unknown")
+
         state = f"Canvas: {self.width}x{self.height}\n"
         if layers:
             state += f"Layers ({len(layers)}):\n" + "\n".join(layers) + "\n"
+        state += f"Active layer: {active or 'root'}\n"
         state += f"Total elements: {elements}"
         return state
+
+    def get_elements_detail(self):
+        """Return detailed info about every element on the canvas.
+        Gives Claude visibility into positions, sizes, colors, and paths."""
+        details = []
+        for elem in self.root.iter():
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            eid = elem.get("id", "")
+            if not eid or tag in ("svg", "defs", "stop", "feMergeNode",
+                                   "feGaussianBlur", "feOffset", "feFlood",
+                                   "feComposite", "feMerge"):
+                continue
+
+            label = elem.get(f"{{{INKSCAPE_NS}}}label", "")
+            style = elem.get("style", "")
+
+            info = f"{tag} id={eid}"
+            if label:
+                info += f" label='{label}'"
+
+            # Position/size info per element type
+            if tag == "rect":
+                info += f" x={elem.get('x')} y={elem.get('y')} w={elem.get('width')} h={elem.get('height')}"
+            elif tag == "circle":
+                info += f" cx={elem.get('cx')} cy={elem.get('cy')} r={elem.get('r')}"
+            elif tag == "ellipse":
+                info += f" cx={elem.get('cx')} cy={elem.get('cy')} rx={elem.get('rx')} ry={elem.get('ry')}"
+            elif tag == "path":
+                d = elem.get("d", "")
+                info += f" d='{d[:80]}{'...' if len(d) > 80 else ''}'"
+            elif tag == "text":
+                info += f" x={elem.get('x')} y={elem.get('y')} text='{(elem.text or '')[:40]}'"
+            elif tag == "polygon":
+                pts = elem.get("points", "")
+                info += f" points='{pts[:60]}{'...' if len(pts) > 60 else ''}'"
+            elif tag == "g":
+                groupmode = elem.get(f"{{{INKSCAPE_NS}}}groupmode", "")
+                if groupmode == "layer":
+                    info += f" [LAYER] children={len(list(elem))}"
+                else:
+                    info += f" [GROUP] children={len(list(elem))}"
+
+            if style:
+                info += f" style='{style[:60]}{'...' if len(style) > 60 else ''}'"
+
+            details.append(info)
+
+        return "\n".join(details) if details else "Canvas is empty"
