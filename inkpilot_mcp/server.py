@@ -484,6 +484,7 @@ def inkpilot_export_png(
 def inkpilot_import_image(
     file_path: str = None,
     base64_data: str = None,
+    base64_file: str = None,
     x: float = 0,
     y: float = 0,
     width: float = None,
@@ -511,50 +512,72 @@ def inkpilot_import_image(
     IMPORTS_DIR = os.path.join(WORK_DIR, "imports")
     os.makedirs(IMPORTS_DIR, exist_ok=True)
     
+    # --- Mode 1: Direct file path (fastest — no decoding needed) ---
     if file_path and os.path.isfile(file_path):
-        # Use the file directly — Inkscape can read it for tracing
         abs_path = os.path.abspath(file_path)
         eid = canvas.embed_image(abs_path, x=x, y=y, width=width, height=height, label=label)
         _save_to_disk()
         return f"Image embedded as {eid} (linked: {abs_path}). Select it and run object-trace to vectorize."
     
-    elif base64_data:
-        # Decode base64, save to disk, then link
+    # --- Mode 2: Base64 file on disk (best for Claude — avoids context bloat) ---
+    # Claude writes base64 to a file via Filesystem tools, passes path here.
+    # This keeps huge base64 strings OUT of the MCP parameter / context window.
+    if base64_file and os.path.isfile(base64_file):
         try:
-            # Strip data URI prefix if accidentally included
+            with open(base64_file, "r") as f:
+                b64_str = f.read().strip()
+            # Strip data URI prefix if present
+            if b64_str.startswith("data:"):
+                b64_str = b64_str.split(",", 1)[1]
+            raw = b64.b64decode(b64_str)
+        except Exception as e:
+            return f"Failed to read/decode base64 file: {e}"
+        # Clean up the temp b64 file
+        try:
+            os.remove(base64_file)
+        except OSError:
+            pass
+        return _save_and_embed_raw(raw, x, y, width, height, label, IMPORTS_DIR)
+    
+    # --- Mode 3: Inline base64 string (fallback — avoid for large images) ---
+    elif base64_data:
+        try:
             if base64_data.startswith("data:"):
                 base64_data = base64_data.split(",", 1)[1]
-            
             raw = b64.b64decode(base64_data)
         except Exception as e:
             return f"Failed to decode base64: {e}"
-        
-        # Detect image type from magic bytes (no imghdr — removed in Python 3.13)
-        ext = "png"  # default
-        if raw[:8] == b'\x89PNG\r\n\x1a\n':
-            ext = "png"
-        elif raw[:3] == b'\xff\xd8\xff':
-            ext = "jpg"
-        elif raw[:4] == b'GIF8':
-            ext = "gif"
-        elif raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
-            ext = "webp"
-        elif raw[:2] == b'BM':
-            ext = "bmp"
-        
-        filename = f"import_{int(time.time())}.{ext}"
-        save_path = os.path.join(IMPORTS_DIR, filename)
-        
-        with open(save_path, "wb") as f:
-            f.write(raw)
-        
-        abs_path = os.path.abspath(save_path)
-        eid = canvas.embed_image(abs_path, x=x, y=y, width=width, height=height, label=label)
-        _save_to_disk()
-        return f"Image saved and embedded as {eid} (file: {abs_path}). Select it and run object-trace to vectorize."
+        return _save_and_embed_raw(raw, x, y, width, height, label, IMPORTS_DIR)
     
     else:
-        return "Error: Provide either file_path or base64_data."
+        return "Error: Provide file_path, base64_file, or base64_data."
+
+
+def _save_and_embed_raw(raw, x, y, width, height, label, imports_dir):
+    """Shared helper: detect type, save to disk, embed in canvas."""
+    # Detect image type from magic bytes (no imghdr — removed in Python 3.13)
+    ext = "png"
+    if raw[:8] == b'\x89PNG\r\n\x1a\n':
+        ext = "png"
+    elif raw[:3] == b'\xff\xd8\xff':
+        ext = "jpg"
+    elif raw[:4] == b'GIF8':
+        ext = "gif"
+    elif raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
+        ext = "webp"
+    elif raw[:2] == b'BM':
+        ext = "bmp"
+    
+    filename = f"import_{int(time.time())}.{ext}"
+    save_path = os.path.join(imports_dir, filename)
+    
+    with open(save_path, "wb") as f:
+        f.write(raw)
+    
+    abs_path = os.path.abspath(save_path)
+    eid = canvas.embed_image(abs_path, x=x, y=y, width=width, height=height, label=label)
+    _save_to_disk()
+    return f"Image embedded as {eid} (file: {abs_path}). Select it and run object-trace to vectorize."
 
 
 @mcp.tool()
