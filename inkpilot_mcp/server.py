@@ -224,6 +224,22 @@ def inkpilot_draw_circle(
 
 
 @mcp.tool()
+def inkpilot_draw_ellipse(
+    cx: float, cy: float, rx: float, ry: float,
+    fill: str = "#ffffff", stroke: str = None,
+    stroke_width: float = None, opacity: float = None, label: str = None,
+) -> str:
+    """Draw an ellipse (oval). rx/ry = horizontal/vertical radii."""
+    kwargs = {"cx": cx, "cy": cy, "rx": rx, "ry": ry, "fill": fill}
+    if stroke: kwargs["stroke"] = stroke
+    if stroke_width is not None: kwargs["stroke_width"] = stroke_width
+    # Note: canvas.draw_ellipse doesn't support all kwargs yet, use insert_svg for advanced
+    eid = canvas.draw_ellipse(**{k: v for k, v in kwargs.items() if k in ['cx','cy','rx','ry','fill','stroke']})
+    _save_to_disk()
+    return f"Ellipse {eid}"
+
+
+@mcp.tool()
 def inkpilot_draw_path(
     d: str, fill: str = "none", stroke: str = "#ffffff",
     stroke_width: float = 1, opacity: float = None,
