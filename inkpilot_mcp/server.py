@@ -125,10 +125,15 @@ def inkpilot_setup_canvas(width: int = 512, height: int = 512) -> str:
     Use inkpilot_read_canvas frequently to inspect your work and make corrections.
     
     SPEED RULES:
-    - When user uploads an image to reproduce: LOOK at it and START DRAWING immediately
-      with shape tools (paths, circles, rects). Do NOT waste time on import/trace for
-      sketches or simple art. Just analyze visually and draw.
-    - Only use inkpilot_import_image when exact bitmap reproduction is needed.
+    - When user uploads an image to reproduce: use the REFERENCE LAYER method:
+      1. bash: base64 -w0 /mnt/user-data/uploads/<filename>  (get base64)
+      2. inkpilot_create_layer('Reference') 
+      3. inkpilot_import_image(base64_data=<output>)  (import onto Reference layer)
+      4. inkpilot_create_layer('Drawing')  (new layer on top)
+      5. Draw shapes tracing the reference (paths, circles, rects)
+      6. inkpilot_delete(<reference_image_id>)  (remove reference when done)
+    - The reference image gives you EXACT coordinates and contours to trace.
+    - Use inkpilot_read_canvas to get the reference image dimensions for accurate tracing.
     - Never "strategize" or "plan" in multiple messages. Just execute."""
     canvas.clear()
     result = canvas.set_canvas(width, height)
@@ -505,16 +510,22 @@ def inkpilot_import_image(
       base64_file — path to a text file containing base64 data (avoids context bloat)
       base64_data — raw base64 string (NO data URI prefix). The tool adds it.
     
-    SPEED: For most sketches/drawings, DON'T use this tool. Instead, visually
-    analyze the image and draw with shape tools (paths, circles, rects).
-    Only use this for exact bitmap reproduction or tracing.
+    REFERENCE LAYER WORKFLOW (preferred for reproducing uploaded images):
+      1. Create a 'Reference' layer and import the image onto it
+      2. Use inkpilot_read_canvas to get the image position and dimensions
+      3. Create a 'Drawing' layer on top
+      4. Trace the reference with shapes (paths, circles, rects)
+      5. Delete the reference image when done -> clean vector output
     
-    FAST PIPELINE (2 calls max for uploaded images):
+    The reference image gives EXACT positions and proportions to trace against.
+    This produces laser-precise reproductions vs drawing from visual memory.
+    
+    FAST PIPELINE (for getting the image onto canvas):
       1. bash: base64 -w0 /mnt/user-data/uploads/image.png  (get base64)
       2. inkpilot_import_image(base64_data=<output>)         (import + embed)
       Do NOT check sizes, strategize, or add intermediate steps.
     
-    After importing, trace with:
+    For auto-vectorization (alternative to manual tracing):
       inkpilot_inkscape_action(select_ids=[image_id], actions="object-trace")
     """
     import base64 as b64
