@@ -10,6 +10,7 @@ import sys
 import os
 import json
 import time
+import threading
 import webbrowser
 
 from mcp.server.fastmcp import FastMCP
@@ -71,8 +72,36 @@ def _ensure_live_server():
     return None
 
 
+# ── Debounced Save ───────────────────────────────────────────────
+
+_save_timer = None
+_save_lock = threading.Lock()
+
+
 def _save_to_disk():
-    """Save canvas to disk. Live preview updates via canvas → SSE automatically."""
+    """Debounced save — batches rapid operations (0.15s delay).
+    Live preview updates instantly via SSE; disk write is deferred."""
+    global _save_timer
+    with _save_lock:
+        if _save_timer is not None:
+            _save_timer.cancel()
+        _save_timer = threading.Timer(0.15, _do_save)
+        _save_timer.daemon = True
+        _save_timer.start()
+
+
+def _save_to_disk_now():
+    """Immediate save — use before Inkscape actions that read from disk."""
+    global _save_timer
+    with _save_lock:
+        if _save_timer is not None:
+            _save_timer.cancel()
+            _save_timer = None
+    _do_save()
+
+
+def _do_save():
+    """Actual disk write."""
     canvas.save(WORK_FILE)
 
 
@@ -85,7 +114,7 @@ def inkpilot_setup_canvas(width: int = 512, height: int = 512) -> str:
     For a 16x16 sprite at pixel size 16, use width=256, height=256."""
     canvas.clear()
     result = canvas.set_canvas(width, height)
-    _save_to_disk()
+    _save_to_disk_now()
 
     live_msg = _ensure_live_server()
     if live_msg:
@@ -345,8 +374,8 @@ def inkpilot_inkscape_action(actions: str, select_ids: list = None) -> str:
     Example: Align all objects to center of page:
       actions="select-all;object-align:hcenter vcenter page"
     """
-    # Save current canvas to disk first
-    _save_to_disk()
+    # Flush to disk immediately (Inkscape reads from file)
+    _save_to_disk_now()
     
     # Build the full action string
     action_parts = []
@@ -387,7 +416,7 @@ def inkpilot_export_png(
     width/height: pixel dimensions (overrides dpi if set).
     element_id: export only this element (None = full page).
     """
-    _save_to_disk()
+    _save_to_disk_now()
     
     if not filename:
         filename = f"inkpilot_{int(time.time())}.png"
@@ -447,7 +476,7 @@ def inkpilot_get_state() -> str:
 def inkpilot_refresh_inkscape() -> str:
     """Reopen the current canvas in Inkscape to see latest changes.
     Call this after a batch of drawing operations so the user sees the update."""
-    _save_to_disk()
+    _save_to_disk_now()
     return open_in_inkscape(WORK_FILE)
 
 

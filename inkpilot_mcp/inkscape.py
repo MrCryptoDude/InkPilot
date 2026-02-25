@@ -6,6 +6,7 @@ import os
 import sys
 import subprocess
 import shutil
+import threading
 
 # Flags to prevent black console windows on Windows
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -138,19 +139,44 @@ def run_inkscape_actions(svg_path, actions_str, output_path=None):
         return False, f"Error running Inkscape: {e}"
 
 
+# ── Singleton Inkscape Window ────────────────────────────────────
+
+_inkscape_proc = None
+_inkscape_lock = threading.Lock()
+
+
+def _is_inkscape_running():
+    """Check if our tracked Inkscape process is still alive."""
+    global _inkscape_proc
+    if _inkscape_proc is None:
+        return False
+    poll = _inkscape_proc.poll()
+    if poll is not None:
+        # Process exited
+        _inkscape_proc = None
+        return False
+    return True
+
+
 def open_in_inkscape(svg_path):
-    """Open an SVG file in Inkscape (one time, for editing the final result)."""
+    """Open SVG in Inkscape. Reuses existing window if already open."""
+    global _inkscape_proc
     exe = find_inkscape()
     if not exe:
         return "Inkscape not found"
-    try:
-        if sys.platform == "win32":
-            subprocess.Popen(
-                [exe, svg_path],
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-        else:
-            subprocess.Popen([exe, svg_path], start_new_session=True)
-        return f"Opened in Inkscape"
-    except Exception as e:
-        return f"Error: {e}"
+    
+    with _inkscape_lock:
+        if _is_inkscape_running():
+            return "Inkscape already open (file auto-saves to same path)"
+        
+        try:
+            if sys.platform == "win32":
+                _inkscape_proc = subprocess.Popen(
+                    [exe, svg_path],
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            else:
+                _inkscape_proc = subprocess.Popen([exe, svg_path], start_new_session=True)
+            return "Opened in Inkscape"
+        except Exception as e:
+            return f"Error: {e}"

@@ -160,7 +160,23 @@ class LiveServer:
             def log_message(self, format, *args):
                 pass
 
-        self._server = http.server.HTTPServer(("127.0.0.1", self.port), Handler)
+        # Allow port reuse to prevent "address already in use" after restart
+        http.server.HTTPServer.allow_reuse_address = True
+        
+        for attempt in range(3):
+            try:
+                self._server = http.server.HTTPServer(("127.0.0.1", self.port), Handler)
+                break
+            except OSError as e:
+                if attempt < 2:
+                    # Port may be held by a dead process — wait and retry
+                    import time as _time
+                    _time.sleep(1)
+                else:
+                    # Last resort: try next port
+                    self.port += 1
+                    self._server = http.server.HTTPServer(("127.0.0.1", self.port), Handler)
+        
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return f"http://localhost:{self.port}"
