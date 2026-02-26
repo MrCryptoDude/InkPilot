@@ -1,0 +1,1 @@
+"""CreativeBridge — Adapters package."""

@@ -17,6 +17,7 @@ build/
 .inkpilot/
 inkpilot_output.svg
 tests/test_output.svg
+screenshots/
 
 # IDE
 .vscode/

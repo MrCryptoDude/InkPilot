@@ -1,23 +1,26 @@
 """
-Inkpilot MCP Server
-Bridge between Claude and Inkscape.
+Inkpilot MCP Server — v4.0 (CreativeBridge Architecture)
 
-Live drawing: browser preview via SSE (instant updates)
-Final result: open in Inkscape for editing
-Config: ~/.inkpilot/config.json controls live_preview on/off
+Claude controls Inkscape through pure code — no mouse simulation needed.
+The SVG engine composes art in memory with mathematical precision.
+Changes flush to disk automatically and Inkscape renders them.
+
+Like VSCode Claude but for art: Claude writes, the app renders.
 """
 import sys
 import os
-import json
 import time
-import threading
-import webbrowser
 
 from mcp.server.fastmcp import FastMCP
 
-from .canvas import SVGCanvas
-from .live_server import LiveServer
-from .inkscape import open_in_inkscape, find_inkscape, run_inkscape_actions
+# Bridge architecture
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from bridge.engine import SVGDocument
+from bridge.adapters.inkscape import InkscapeAdapter
+
+# Legacy tools (remote control, SVG reader)
+from .svg_reader import SVGReader
+from . import remote
 
 # ── Paths ────────────────────────────────────────────────────────
 
@@ -27,656 +30,760 @@ def _home():
 WORK_DIR = os.path.join(_home(), ".inkpilot")
 WORK_FILE = os.path.join(WORK_DIR, "canvas.svg")
 OUTPUT_DIR = os.path.join(WORK_DIR, "output")
-CONFIG_FILE = os.path.join(WORK_DIR, "config.json")
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCREENSHOT_DIR = os.path.join(_PROJECT_DIR, "screenshots")
 
 os.makedirs(WORK_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
-# ── Config ───────────────────────────────────────────────────────
+# ── Globals ──────────────────────────────────────────────────────
 
-def _load_config():
-    """Read config.json. Tray app writes this, we just read."""
-    defaults = {"live_preview": True}
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE) as f:
-                data = json.load(f)
-            return {**defaults, **data}
-    except Exception:
-        pass
-    return defaults
-
-# ── State ────────────────────────────────────────────────────────
-
-canvas = SVGCanvas(512, 512)
-
-def _open_inkscape_callback():
-    """Callback for live preview's 'Open in Inkscape' button."""
-    from .inkscape import open_in_inkscape as _open
-    _do_save()  # Ensure file is on disk
-    return _open(WORK_FILE, force_reload=True)
-
-live = LiveServer(canvas, port=7878, open_inkscape_fn=_open_inkscape_callback)
+doc = SVGDocument(512, 512)
+adapter = InkscapeAdapter(WORK_FILE, OUTPUT_DIR)
+reader = SVGReader(WORK_FILE)
 mcp = FastMCP("inkpilot")
-_live_started = False
 
 
-def _ensure_live_server():
-    """Start the SSE server (always runs for manual access).
-    Only auto-opens the browser if live_preview is ON."""
-    global _live_started
-    if not _live_started:
-        url = live.start()
-        _live_started = True
-
-        # Read config at the moment of first draw (fresh read each session)
-        config = _load_config()
-        if config.get("live_preview", True):
-            webbrowser.open(url)
-            return f"Live preview: {url}"
-        else:
-            return f"Live preview available at {url} (auto-open disabled)"
-    return None
+def _auto_flush():
+    """Write current document to disk so Inkscape can render it."""
+    doc.flush(WORK_FILE)
 
 
-# ── Debounced Save ───────────────────────────────────────────────
-
-_save_timer = None
-_save_lock = threading.Lock()
-
-
-def _save_to_disk():
-    """Debounced save — batches rapid operations (0.15s delay).
-    Live preview updates instantly via SSE; disk write is deferred."""
-    global _save_timer
-    with _save_lock:
-        if _save_timer is not None:
-            _save_timer.cancel()
-        _save_timer = threading.Timer(0.15, _do_save)
-        _save_timer.daemon = True
-        _save_timer.start()
-
-
-def _save_to_disk_now():
-    """Immediate save — use before Inkscape actions that read from disk."""
-    global _save_timer
-    with _save_lock:
-        if _save_timer is not None:
-            _save_timer.cancel()
-            _save_timer = None
-    _do_save()
-
-
-def _do_save():
-    """Actual disk write."""
-    canvas.save(WORK_FILE)
-
-
-# ── Tools ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# SETUP
+# ══════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def inkpilot_setup_canvas(width: int = 512, height: int = 512) -> str:
-    """ALWAYS call this first. Sets up the canvas and opens Inkscape with the working file.
-    For a 32x32 sprite at pixel size 8, use width=256, height=256.
-    For a 16x16 sprite at pixel size 16, use width=256, height=256.
+    """Create a new SVG project and open it in Inkscape.
     
-    WORKFLOW: Draw shapes (circles, rects, paths) → use inkpilot_inkscape_action for
-    boolean ops (union, difference), smoothing, alignment, and 200+ filters.
-    Use inkpilot_read_canvas frequently to inspect your work and make corrections.
+    This creates a blank SVG file and opens Inkscape.
     
-    SPEED RULES:
-    - When user uploads an image to reproduce: use the REFERENCE LAYER method:
-      1. bash: base64 -w0 /mnt/user-data/uploads/<filename>  (get base64)
-      2. inkpilot_create_layer('Reference') 
-      3. inkpilot_import_image(base64_data=<output>)  (import onto Reference layer)
-      4. inkpilot_create_layer('Drawing')  (new layer on top)
-      5. Draw shapes tracing the reference (paths, circles, rects)
-      6. inkpilot_delete(<reference_image_id>)  (remove reference when done)
-    - The reference image gives you EXACT coordinates and contours to trace.
-    - Use inkpilot_read_canvas to get the reference image dimensions for accurate tracing.
-    - Never "strategize" or "plan" in multiple messages. Just execute."""
-    canvas.clear()
-    result = canvas.set_canvas(width, height)
-    _save_to_disk_now()
-
-    live_msg = _ensure_live_server()
-    if live_msg:
-        result += f"\n{live_msg}"
+    PRIMARY WORKFLOW (precision art):
+    1. Use inkpilot_compose() to create elements with exact SVG paths
+    2. Use inkpilot_add_gradient() for gradients and shading
+    3. Use inkpilot_set_style() to adjust colors
+    4. Use inkpilot_inkscape_action() for boolean ops, alignment
+    5. Export with inkpilot_export_png() or inkpilot_save()
     
-    # Auto-open Inkscape (singleton — won't open duplicates)
-    ink_msg = open_in_inkscape(WORK_FILE)
-    result += f"\n{ink_msg}"
-    result += f"\nWorking file: {WORK_FILE}"
-    return result
-
-
-@mcp.tool()
-def inkpilot_create_layer(label: str) -> str:
-    """Create a named layer and make it active. Use layers for organization:
-    Shadow, Background, Body, Weapons, Effects, UI, etc.
-    All subsequent draws go into this layer."""
-    result = canvas.create_layer(label)
-    _save_to_disk()
-    return result
-
-
-@mcp.tool()
-def inkpilot_switch_layer(label: str) -> str:
-    """Switch to an existing layer by name."""
-    result = canvas.switch_layer(label)
-    _save_to_disk()
-    return result
-
-
-@mcp.tool()
-def inkpilot_draw_pixel_region(
-    pixels: list,
-    size: int = 8,
-    offset_x: int = 0,
-    offset_y: int = 0,
-    label: str = None,
-) -> str:
-    """Draw a batch of pixels as a group. Best for pixel art style graphics.
-    Each pixel: [x, y, "#hexcolor"]. Null color = transparent (skip).
+    SECONDARY WORKFLOW (manual drawing via remote control):
+    - inkpilot_drag() to draw with mouse simulation
+    - inkpilot_key() for keyboard shortcuts
+    - inkpilot_screenshot() to visually verify
     
-    size = pixel size in SVG units. size=8 means each logical pixel is 8x8 SVG units.
-    offset_x/offset_y = shift the entire region (in pixel coordinates).
-    label = name for this group (e.g. "sword_blade", "helmet_outline").
-    
-    For live animation effect: draw parts separately — outline, then fill, 
-    then highlights, then shadow. Each call updates Inkscape!
-    
-    Example: [[0,0,"#8B4513"], [1,0,"#A0522D"], [0,1,"#6B3410"]]"""
-    result = canvas.draw_pixel_region(
-        pixels=pixels, size=size,
-        offset_x=offset_x, offset_y=offset_y, label=label,
-    )
-    _save_to_disk()
-    return result
-
-
-@mcp.tool()
-def inkpilot_draw_pixel_row(y: int, colors: list, size: int = 8, start_x: int = 0) -> str:
-    """Draw one row of pixels. Colors array: ["#ff0000", null, "#00ff00", ...].
-    Null = transparent. Creates a scanline effect when called row by row."""
-    ids = canvas.draw_pixel_row(y=y, colors=colors, size=size, start_x=start_x)
-    _save_to_disk()
-    return f"Drew {len(ids)} pixels on row {y}"
-
-
-@mcp.tool()
-def inkpilot_draw_rect(
-    x: float, y: float, width: float, height: float,
-    fill: str = "#ffffff", stroke: str = None,
-    stroke_width: float = None, rx: float = 0,
-    opacity: float = None, label: str = None,
-) -> str:
-    """Draw a rectangle. Great for health bars, UI panels, tile backgrounds."""
-    kwargs = {"x": x, "y": y, "width": width, "height": height, "fill": fill, "rx": rx}
-    if stroke: kwargs["stroke"] = stroke
-    if stroke_width is not None: kwargs["stroke_width"] = stroke_width
-    if opacity is not None: kwargs["opacity"] = opacity
-    if label: kwargs["label"] = label
-    eid = canvas.draw_rect(**kwargs)
-    _save_to_disk()
-    return f"Rectangle {eid}"
-
-
-@mcp.tool()
-def inkpilot_draw_circle(
-    cx: float, cy: float, r: float,
-    fill: str = "#ffffff", stroke: str = None,
-    stroke_width: float = None, opacity: float = None, label: str = None,
-) -> str:
-    """Draw a circle."""
-    kwargs = {"cx": cx, "cy": cy, "r": r, "fill": fill}
-    if stroke: kwargs["stroke"] = stroke
-    if stroke_width is not None: kwargs["stroke_width"] = stroke_width
-    if opacity is not None: kwargs["opacity"] = opacity
-    if label: kwargs["label"] = label
-    eid = canvas.draw_circle(**kwargs)
-    _save_to_disk()
-    return f"Circle {eid}"
-
-
-@mcp.tool()
-def inkpilot_draw_ellipse(
-    cx: float, cy: float, rx: float, ry: float,
-    fill: str = "#ffffff", stroke: str = None,
-    stroke_width: float = None, opacity: float = None, label: str = None,
-) -> str:
-    """Draw an ellipse (oval). rx/ry = horizontal/vertical radii."""
-    kwargs = {"cx": cx, "cy": cy, "rx": rx, "ry": ry, "fill": fill}
-    if stroke: kwargs["stroke"] = stroke
-    if stroke_width is not None: kwargs["stroke_width"] = stroke_width
-    # Note: canvas.draw_ellipse doesn't support all kwargs yet, use insert_svg for advanced
-    eid = canvas.draw_ellipse(**{k: v for k, v in kwargs.items() if k in ['cx','cy','rx','ry','fill','stroke']})
-    _save_to_disk()
-    return f"Ellipse {eid}"
-
-
-@mcp.tool()
-def inkpilot_draw_path(
-    d: str, fill: str = "none", stroke: str = "#ffffff",
-    stroke_width: float = 1, opacity: float = None,
-    filter_id: str = None, clip_path_id: str = None,
-    label: str = None,
-) -> str:
-    """Draw an SVG path. For complex shapes, curves, outlines.
-    d = SVG path data (M, L, C, Q, A, Z commands). Use C for smooth cubic bezier curves.
-    fill can be a color (#hex) or a gradient reference 'url(#gradient_id)'.
-    filter_id = ID of a filter added with add_filter (for blur/shadow).
-    clip_path_id = ID of a clip path added with add_clip_path."""
-    kwargs = {"d": d, "fill": fill, "stroke": stroke, "stroke_width": stroke_width}
-    if opacity is not None: kwargs["opacity"] = opacity
-    if filter_id: kwargs["filter_id"] = filter_id
-    if clip_path_id: kwargs["clip_path_id"] = clip_path_id
-    if label: kwargs["label"] = label
-    eid = canvas.draw_path(**kwargs)
-    _save_to_disk()
-    return f"Path {eid}"
-
-
-@mcp.tool()
-def inkpilot_draw_text(
-    x: float, y: float, content: str,
-    font_size: float = 16, fill: str = "#ffffff", font_family: str = "sans-serif",
-) -> str:
-    """Add text to the canvas."""
-    eid = canvas.draw_text(x=x, y=y, content=content, font_size=font_size,
-                           fill=fill, font_family=font_family)
-    _save_to_disk()
-    return f"Text {eid}"
-
-
-@mcp.tool()
-def inkpilot_draw_polygon(points: str, fill: str = "#ffffff", stroke: str = None) -> str:
-    """Draw a polygon. points = 'x1,y1 x2,y2 x3,y3 ...'"""
-    kwargs = {"points": points, "fill": fill}
-    if stroke: kwargs["stroke"] = stroke
-    eid = canvas.draw_polygon(**kwargs)
-    _save_to_disk()
-    return f"Polygon {eid}"
-
-
-@mcp.tool()
-def inkpilot_add_gradient(
-    gradient_id: str,
-    colors: list,
-    x1: str = "0%", y1: str = "0%",
-    x2: str = "0%", y2: str = "100%",
-    gradient_type: str = "linear",
-) -> str:
-    """Add a gradient to defs for use as fill='url(#gradient_id)'.
-    colors = list of [offset, color] pairs, e.g. [["0%", "#8B5E3C"], ["100%", "#5C3D2E"]].
-    gradient_type = 'linear' or 'radial'.
-    For radial: x1=cx, y1=cy, x2=r (radius)."""
-    tuples = [(c[0], c[1]) for c in colors]
-    result = canvas.add_gradient(gradient_id, tuples, x1, y1, x2, y2, gradient_type)
-    _save_to_disk()
-    return f"Gradient '{result}' added. Use fill='url(#{result})'"
-
-
-@mcp.tool()
-def inkpilot_add_filter(
-    filter_id: str,
-    blur_std: float = None,
-    shadow_dx: float = None,
-    shadow_dy: float = None,
-    shadow_blur: float = None,
-    shadow_color: str = None,
-) -> str:
-    """Add a filter (blur, drop shadow) to defs for use as filter='url(#filter_id)'.
-    For blur only: set blur_std (e.g. 2.0).
-    For drop shadow: set shadow_dx, shadow_dy, shadow_blur, shadow_color.
-    Can combine both."""
-    result = canvas.add_filter(filter_id, blur_std, shadow_dx, shadow_dy, shadow_blur, shadow_color)
-    _save_to_disk()
-    return f"Filter '{result}' added. Apply with filter='url(#{result})'"
-
-
-@mcp.tool()
-def inkpilot_add_clip_path(clip_id: str, shape_d: str) -> str:
-    """Add a clip path to defs. shape_d is an SVG path 'd' string.
-    Apply to elements via clip-path='url(#clip_id)' in style."""
-    result = canvas.add_clip_path(clip_id, shape_d)
-    _save_to_disk()
-    return f"Clip path '{result}' added"
-
-
-@mcp.tool()
-def inkpilot_inkscape_action(actions: str, select_ids: list = None) -> str:
-    """Run Inkscape's native engine on the canvas. This is POWERFUL.
-    
-    Workflow: select elements by ID, then apply operations.
-    
-    actions: semicolon-separated Inkscape action commands.
-    select_ids: optional list of element IDs to pre-select (convenience shortcut).
-    
-    BOOLEAN OPERATIONS (select 2+ paths first):
-      path-union          - Merge selected paths into one
-      path-difference     - Bottom minus top
-      path-intersection   - Keep only overlapping area
-      path-exclusion      - XOR (parts belonging to only one path)
-      path-combine        - Combine into compound path
-      path-break-apart    - Break compound path into subpaths
-      path-flatten        - Flatten overlapping objects into visible parts
-      path-fracture       - Fracture into all possible segments
-      path-simplify       - Remove extra nodes (smooth/simplify)
-      path-cut            - Cut bottom path's stroke into pieces
-      path-division       - Cut bottom path into pieces
-    
-    OBJECT OPERATIONS:
-      object-to-path                - Convert shapes to paths
-      object-stroke-to-path         - Convert strokes to filled paths
-      object-align:left page        - Align (left|hcenter|right|top|vcenter|bottom) (page|drawing|selection)
-      object-distribute:hgap        - Distribute (hgap|vgap|left|right|top|bottom)
-      object-flip-horizontal        - Flip horizontally
-      object-flip-vertical          - Flip vertically
-      object-set-attribute:attr,val - Set SVG attribute
-      object-set-clip               - Use topmost as clipping path
-      object-set-mask               - Use topmost as mask
-      object-trace                  - Bitmap trace
-    
-    TRANSFORMS:
-      transform-rotate:45           - Rotate by degrees
-      transform-scale:1.5           - Scale by factor
-      transform-translate:10,20     - Move by dx,dy
-    
-    SELECTION:
-      select-by-id:id1,id2          - Select specific elements
-      select-all                    - Select everything
-      select-clear                  - Deselect all
-    
-    STACKING:
-      selection-group               - Group selected
-      selection-ungroup             - Ungroup selected
-      selection-top                 - Raise to top
-      selection-bottom              - Lower to bottom
-    
-    FILTERS (200+ artistic effects, e.g.):
-      org.inkscape.effect.filter.Blur          - Blur
-      org.inkscape.effect.filter.f038          - Neon light
-      org.inkscape.effect.filter.f020          - Oil painting
-      org.inkscape.effect.filter.f223          - Bright chrome
-      org.inkscape.effect.filter.f114          - 3D marble texture
-      org.inkscape.effect.filter.crosssmooth   - Smooth edges
-    
-    EXPORT (usually auto-appended):
-      export-filename:path  - Set output path
-      export-type:svg       - Set format (svg, png, pdf)
-      export-dpi:300        - Set resolution
-      export-do             - Execute export
-    
-    Example: Merge two circles into one shape:
-      select_ids=["circle_001", "circle_002"], actions="path-union"
-    
-    Example: Simplify a complex path:
-      select_ids=["path_005"], actions="path-simplify"
-    
-    Example: Align all objects to center of page:
-      actions="select-all;object-align:hcenter vcenter page"
+    KEYBOARD SHORTCUTS (press with inkpilot_key):
+      r = rectangle tool    e = ellipse tool      p = pen/bezier tool
+      b = pencil/freehand   t = text tool         n = node editor
+      s = star tool          g = gradient tool     d = dropper tool
+      f5 = fill & stroke dialog    ctrl+z = undo
+      ctrl+s = save         ctrl+shift+e = export dialog
+      + = zoom in           - = zoom out          5 = zoom to fit
     """
-    # Flush to disk immediately (Inkscape reads from file)
-    _save_to_disk_now()
+    global doc
+    doc = SVGDocument(width, height)
+    _auto_flush()
     
-    # Build the full action string
-    action_parts = []
+    ok, msg = adapter.launch(WORK_FILE)
+    time.sleep(2)
     
-    # Pre-select elements if IDs provided
-    if select_ids:
-        ids_str = ",".join(select_ids)
-        action_parts.append(f"select-by-id:{ids_str}")
+    connected = adapter.is_connected
     
-    # Add the user's actions
-    action_parts.append(actions.strip(";"))
+    result = [
+        f"Canvas: {width}×{height}",
+        f"File: {WORK_FILE}",
+        f"Inkscape: {msg}",
+        f"Connected: {connected}",
+        f"",
+        f"Ready. Use inkpilot_compose() to draw with precision.",
+        f"All elements auto-flush to disk — Inkscape renders them.",
+    ]
+    return "\n".join(result)
+
+
+# ══════════════════════════════════════════════════════════════════
+# COMPOSE — Claude's artistic power (precision SVG generation)
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def inkpilot_compose(elements: list) -> str:
+    """Draw precise SVG elements directly — Claude's artistic toolkit.
     
-    full_actions = ";".join(action_parts)
+    This is how you create PROFESSIONAL artwork. Instead of dragging
+    shapes with a mouse, you specify exact SVG elements with bezier
+    curves, gradients, and pixel-perfect positioning.
     
-    # Run Inkscape CLI
-    success, message = run_inkscape_actions(WORK_FILE, full_actions)
+    elements: list of element dicts. Each element has:
+      - 'type': 'ellipse'|'circle'|'rect'|'path'|'text'
+      - type-specific params (see below)
+      - 'fill': color string (default '#8B6914')
+      - 'stroke': color string (default 'none')
+      - 'stroke_width': number (default 0)
+      - 'opacity': 0.0–1.0 (default 1.0)
+      - 'id': optional element ID for later reference
+      - 'layer': layer name (default 'artwork')
+      - 'transform': SVG transform string (optional)
     
-    if success:
-        # Reload the modified SVG back into canvas
-        reload_msg = canvas.reload_from_file(WORK_FILE)
-        return f"Inkscape action completed.\n{message}\n{reload_msg}"
+    Type-specific params:
+      ellipse: cx, cy, rx, ry
+      circle:  cx, cy, r
+      rect:    x, y, w, h, rx (optional corner radius)
+      path:    d (SVG path data string)
+      text:    x, y, content, font_size, font_family
+    
+    SVG Path commands (for 'path' type):
+      M x y      — move to
+      L x y      — line to  
+      C x1 y1, x2 y2, x y — cubic bezier
+      Q x1 y1, x y — quadratic bezier
+      A rx ry rot large-arc sweep x y — arc
+      Z          — close path
+    
+    Example — draw a beaver body with gradient:
+    [
+      {"type": "path", "fill": "#8B6914",
+       "d": "M 200 300 C 150 200, 350 200, 300 300 C 350 400, 150 400, 200 300 Z"},
+      {"type": "ellipse", "cx": 250, "cy": 180, "rx": 60, "ry": 50, "fill": "#A0772B"},
+      {"type": "circle", "cx": 235, "cy": 170, "r": 8, "fill": "#000000"}
+    ]
+    
+    Returns list of element IDs.
+    """
+    if not elements:
+        return "No elements provided."
+    
+    ids = doc.batch(elements)
+    _auto_flush()
+    
+    return f"Composed {len(ids)} elements: {', '.join(ids)}\nAuto-flushed to disk."
+
+
+@mcp.tool()
+def inkpilot_add_gradient(grad_id: str, grad_type: str = "linear",
+                          stops: list = None,
+                          x1: str = "0%", y1: str = "0%",
+                          x2: str = "0%", y2: str = "100%",
+                          cx: str = "50%", cy: str = "50%",
+                          r: str = "50%") -> str:
+    """Add a gradient definition for use in fills.
+    
+    grad_id: unique name (e.g. 'fur_gradient')
+    grad_type: 'linear' or 'radial'
+    stops: list of [offset%, color, opacity] arrays
+      e.g. [[0, "#8B6914", 1.0], [100, "#5C4400", 1.0]]
+    
+    Use in fills as: "url(#fur_gradient)"
+    """
+    stop_tuples = [(s[0], s[1], s[2]) for s in (stops or [])]
+    
+    if grad_type == "radial":
+        doc.radial_gradient(grad_id, stop_tuples, cx=cx, cy=cy, r=r)
     else:
-        return f"Inkscape action failed: {message}"
+        doc.linear_gradient(grad_id, stop_tuples, x1=x1, y1=y1, x2=x2, y2=y2)
+    
+    _auto_flush()
+    return f"Gradient '{grad_id}' added. Use fill='url(#{grad_id})' in elements."
+
+
+@mcp.tool()
+def inkpilot_set_style(elem_id: str, fill: str = None, stroke: str = None,
+                       stroke_width: float = None, opacity: float = None) -> str:
+    """Change the style of an existing element by ID."""
+    kwargs = {}
+    if fill is not None: kwargs["fill"] = fill
+    if stroke is not None: kwargs["stroke"] = stroke
+    if stroke_width is not None: kwargs["stroke_width"] = stroke_width
+    if opacity is not None: kwargs["opacity"] = opacity
+    
+    doc.set_style(elem_id, **kwargs)
+    _auto_flush()
+    return f"Style updated for '{elem_id}'."
+
+
+@mcp.tool()
+def inkpilot_clear_canvas(layer: str = None) -> str:
+    """Clear all elements from the canvas (or a specific layer)."""
+    doc.clear(layer)
+    _auto_flush()
+    return f"Canvas cleared{f' (layer: {layer})' if layer else ''}."
+
+
+# ══════════════════════════════════════════════════════════════════
+# EXPORT & SAVE
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def inkpilot_save(filename: str = None) -> str:
+    """Save the finished SVG to the output folder for delivery.
+    Returns the path so the file can be shared with the user."""
+    if not filename:
+        filename = f"inkpilot_{int(time.time())}.svg"
+    if not filename.endswith(".svg"):
+        filename += ".svg"
+    out_path = os.path.join(OUTPUT_DIR, filename)
+    
+    _auto_flush()
+    import shutil
+    shutil.copy2(WORK_FILE, out_path)
+    return f"Saved to {out_path}"
 
 
 @mcp.tool()
 def inkpilot_export_png(
-    filename: str = None,
-    dpi: int = 96,
-    width: int = None,
-    height: int = None,
-    element_id: str = None,
+    filename: str = None, dpi: int = 96,
+    width: int = None, height: int = None,
 ) -> str:
-    """Export the canvas (or a specific element) as PNG.
-    
-    filename: output name (saved to ~/.inkpilot/output/). Defaults to timestamped name.
-    dpi: resolution (96 for screen, 300 for print).
-    width/height: pixel dimensions (overrides dpi if set).
-    element_id: export only this element (None = full page).
-    """
-    _save_to_disk_now()
+    """Export the canvas as PNG for delivery.
+    filename: saved to ~/.inkpilot/output/. dpi: 96=screen, 300=print."""
+    _auto_flush()
     
     if not filename:
         filename = f"inkpilot_{int(time.time())}.png"
     if not filename.endswith(".png"):
         filename += ".png"
-    
     out_path = os.path.join(OUTPUT_DIR, filename)
     
-    action_parts = []
-    if element_id:
-        action_parts.append(f"export-id:{element_id}")
-        action_parts.append("export-id-only")
-    else:
-        action_parts.append("export-area-page")
-    
-    action_parts.append(f"export-filename:{out_path}")
-    action_parts.append(f"export-dpi:{dpi}")
-    if width:
-        action_parts.append(f"export-width:{width}")
-    if height:
-        action_parts.append(f"export-height:{height}")
-    action_parts.append("export-do")
-    
-    actions_str = ";".join(action_parts)
-    success, message = run_inkscape_actions(WORK_FILE, actions_str)
-    
-    if success:
-        return f"Exported PNG: {out_path}\n{message}"
-    else:
-        return f"PNG export failed: {message}"
+    ok, result = adapter.export_png(out_path, dpi=dpi, width=width, height=height)
+    if ok:
+        return f"Exported PNG: {result}"
+    return f"Export failed: {result}"
 
+
+# ══════════════════════════════════════════════════════════════════
+# INKSCAPE CLI — For app-native operations
+# ══════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def inkpilot_import_image(
-    file_path: str = None,
-    base64_data: str = None,
-    base64_file: str = None,
-    x: float = 0,
-    y: float = 0,
-    width: float = None,
-    height: float = None,
-    label: str = None,
-) -> str:
-    """Import a raster image (PNG/JPG/WEBP/etc) onto the canvas.
+def inkpilot_inkscape_action(actions: str, select_ids: list = None) -> str:
+    """Run Inkscape CLI actions on the SVG file.
     
-    Three input modes:
-      file_path  — absolute path to an image on disk (FASTEST — preferred for tracing)
-      base64_file — path to a text file containing base64 data (avoids context bloat)
-      base64_data — raw base64 string (NO data URI prefix). The tool adds it.
+    Use this for operations that are faster via CLI than mouse:
+    - object-trace (bitmap vectorization)
+    - path-union, path-difference (boolean operations)
+    - path-simplify (smooth paths)
+    - transform-rotate:45, transform-scale:1.5
+    - object-align:hcenter vcenter page
     
-    REFERENCE LAYER WORKFLOW (preferred for reproducing uploaded images):
-      1. Create a 'Reference' layer and import the image onto it
-      2. Use inkpilot_read_canvas to get the image position and dimensions
-      3. Create a 'Drawing' layer on top
-      4. Trace the reference with shapes (paths, circles, rects)
-      5. Delete the reference image when done -> clean vector output
+    IMPORTANT: Save the file first (ctrl+s via inkpilot_key) before
+    running CLI actions, as CLI reads from disk.
     
-    The reference image gives EXACT positions and proportions to trace against.
-    This produces laser-precise reproductions vs drawing from visual memory.
-    
-    FAST PIPELINE (for getting the image onto canvas):
-      1. bash: base64 -w0 /mnt/user-data/uploads/image.png  (get base64)
-      2. inkpilot_import_image(base64_data=<output>)         (import + embed)
-      Do NOT check sizes, strategize, or add intermediate steps.
-    
-    For auto-vectorization (alternative to manual tracing):
-      inkpilot_inkscape_action(select_ids=[image_id], actions="object-trace")
+    select_ids: list of element IDs to pre-select.
+    actions: semicolon-separated Inkscape action commands.
     """
-    import base64 as b64
-    
-    IMPORTS_DIR = os.path.join(WORK_DIR, "imports")
-    os.makedirs(IMPORTS_DIR, exist_ok=True)
-    
-    # --- Mode 1: Direct file path (fastest — no decoding needed) ---
-    if file_path and os.path.isfile(file_path):
-        abs_path = os.path.abspath(file_path)
-        eid = canvas.embed_image(abs_path, x=x, y=y, width=width, height=height, label=label)
-        _save_to_disk()
-        return f"Image embedded as {eid}. Auto-scaled to fit canvas. Use inkpilot_read_canvas for exact bounds."
-    
-    # --- Mode 2: Base64 file on disk (best for Claude — avoids context bloat) ---
-    # Claude writes base64 to a file via Filesystem tools, passes path here.
-    # This keeps huge base64 strings OUT of the MCP parameter / context window.
-    if base64_file and os.path.isfile(base64_file):
-        try:
-            with open(base64_file, "r") as f:
-                b64_str = f.read().strip()
-            # Strip data URI prefix if present
-            if b64_str.startswith("data:"):
-                b64_str = b64_str.split(",", 1)[1]
-            raw = b64.b64decode(b64_str)
-        except Exception as e:
-            return f"Failed to read/decode base64 file: {e}"
-        # Clean up the temp b64 file
-        try:
-            os.remove(base64_file)
-        except OSError:
-            pass
-        return _save_and_embed_raw(raw, x, y, width, height, label, IMPORTS_DIR)
-    
-    # --- Mode 3: Inline base64 string (fallback — avoid for large images) ---
-    elif base64_data:
-        try:
-            if base64_data.startswith("data:"):
-                base64_data = base64_data.split(",", 1)[1]
-            raw = b64.b64decode(base64_data)
-        except Exception as e:
-            return f"Failed to decode base64: {e}"
-        return _save_and_embed_raw(raw, x, y, width, height, label, IMPORTS_DIR)
-    
-    else:
-        return "Error: Provide file_path, base64_file, or base64_data."
-
-
-def _save_and_embed_raw(raw, x, y, width, height, label, imports_dir):
-    """Shared helper: detect type, save to disk, embed in canvas (as inline base64)."""
-    # Detect image type from magic bytes (no imghdr — removed in Python 3.13)
-    ext = "png"
-    if raw[:8] == b'\x89PNG\r\n\x1a\n':
-        ext = "png"
-    elif raw[:3] == b'\xff\xd8\xff':
-        ext = "jpg"
-    elif raw[:4] == b'GIF8':
-        ext = "gif"
-    elif raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
-        ext = "webp"
-    elif raw[:2] == b'BM':
-        ext = "bmp"
-    
-    filename = f"import_{int(time.time())}.{ext}"
-    save_path = os.path.join(imports_dir, filename)
-    
-    with open(save_path, "wb") as f:
-        f.write(raw)
-    
-    abs_path = os.path.abspath(save_path)
-    eid = canvas.embed_image(abs_path, x=x, y=y, width=width, height=height, label=label)
-    _save_to_disk()
-    return f"Image embedded as {eid}. Use inkpilot_read_canvas to get exact position/size for tracing."
+    _auto_flush()
+    ok, msg = adapter.execute(actions, select_ids)
+    return msg
 
 
 @mcp.tool()
-def inkpilot_insert_svg(svg: str) -> str:
-    """Insert raw SVG markup. No outer <svg> tags — just inner elements.
-    For complex elements not covered by other tools."""
-    result = canvas.insert_svg(svg)
-    _save_to_disk()
-    return result
+def inkpilot_import_image(file_path: str) -> str:
+    """Import a raster image into the current Inkscape document.
+    file_path: absolute path to image on disk.
+    
+    Uses Inkscape CLI's file-import action.
+    After import, use inkpilot_screenshot() to see the result.
+    """
+    if not file_path or not os.path.isfile(file_path):
+        return f"Error: File not found: {file_path}"
+    
+    _auto_flush()
+    abs_path = os.path.abspath(file_path)
+    ok, msg = adapter.execute(f"file-import:{abs_path}")
+    return msg
+
+
+# ══════════════════════════════════════════════════════════════════
+# REMOTE CONTROL — Secondary workflow (mouse/keyboard simulation)
+# ══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def inkpilot_screenshot(save_path: str = None) -> str:
+    """Capture what Inkscape looks like right now.
+    
+    This is your EYES — screenshot the Inkscape window to see:
+    - The canvas and what you've drawn
+    - Which tool is selected
+    - The toolbox, menus, and panels
+    - Dialog windows
+    
+    Returns the path to the screenshot PNG.
+    Use this FREQUENTLY to verify your work and find click targets.
+    
+    The screenshot is saved to the project's assets folder so you can view it.
+    """
+    if not save_path:
+        save_path = os.path.join(SCREENSHOT_DIR, f"screen_{int(time.time())}.png")
+    
+    ok, msg, path = remote.screenshot(save_path)
+    if ok:
+        return f"Screenshot saved: {path}\nUse Filesystem tools to view it."
+    return f"Screenshot failed: {msg}"
 
 
 @mcp.tool()
-def inkpilot_delete(element_id: str) -> str:
-    """Delete an element by ID."""
-    result = canvas.delete_element(element_id)
-    _save_to_disk()
-    return result
+def inkpilot_click(x: int, y: int, button: str = "left") -> str:
+    """Click at position (x, y) in the Inkscape window.
+    
+    Coordinates are relative to the Inkscape window's top-left corner.
+    Use inkpilot_screenshot() first to see where things are.
+    
+    button: 'left' (default), 'right' (context menu), 'double' (double-click).
+    
+    Common click targets (approximate — verify with screenshot):
+    - Toolbox is on the left edge
+    - Canvas is the large center area
+    - Properties/panels are on the right
+    - Color palette is at the bottom
+    """
+    ok, msg = remote.click(x, y, button)
+    return msg
 
 
 @mcp.tool()
-def inkpilot_get_state() -> str:
-    """Get canvas state: size, layers, element count. Call this to see what exists."""
-    return canvas.get_state() + f"\nFile: {WORK_FILE}"
+def inkpilot_drag(x1: int, y1: int, x2: int, y2: int,
+                  duration: float = 0.5, button: str = "left",
+                  deselect: bool = True) -> str:
+    """Drag from (x1,y1) to (x2,y2) in the Inkscape window.
+    
+    This is your main DRAWING tool. Use it to:
+    - Draw rectangles (select rect tool, then drag)
+    - Draw ellipses (select ellipse tool, then drag)
+    - Draw freehand lines (select pencil tool, then drag)
+    - Move objects (click and drag with deselect=False)
+    - Select multiple objects (drag selection rectangle with deselect=False)
+    - Resize objects (drag handles with deselect=False)
+    
+    duration: seconds for the drag motion (slower = more precise).
+    Coordinates are relative to the Inkscape window.
+    
+    deselect: if True (default), presses Escape after drawing to deselect
+    the shape. This prevents the NEXT drag from modifying/moving the shape
+    you just drew. Set to False when you intentionally want to move or
+    resize an existing selection.
+    """
+    ok, msg = remote.drag(x1, y1, x2, y2, duration, button)
+    if ok and deselect:
+        time.sleep(0.3)
+        remote.key("f1")
+        time.sleep(0.2)
+        remote.click(200, 400)
+        time.sleep(0.15)
+    return msg
 
+
+@mcp.tool()
+def inkpilot_drag_path(points: list, duration_per_segment: float = 0.2,
+                      deselect: bool = True) -> str:
+    """Drag along a series of points for complex strokes.
+    
+    points: [[x1,y1], [x2,y2], [x3,y3], ...]
+    
+    Use with the pencil/freehand tool (key 'b') to draw curved lines,
+    or with the pen/bezier tool (key 'p') for precise paths.
+    
+    duration_per_segment: seconds per segment (slower = smoother).
+    deselect: if True (default), deselects after drawing so next stroke is new.
+    """
+    pts = [(p[0], p[1]) for p in points]
+    ok, msg = remote.drag_path(pts, duration_per_segment)
+    if ok and deselect:
+        time.sleep(0.3)
+        remote.key("f1")
+        time.sleep(0.2)
+        remote.click(200, 400)
+        time.sleep(0.15)
+    return msg
+
+
+@mcp.tool()
+def inkpilot_key(keys: str) -> str:
+    """Press keyboard key(s) in Inkscape.
+    
+    INKSCAPE TOOL SHORTCUTS:
+      r = Rectangle tool       e = Ellipse/circle tool
+      p = Pen/bezier tool      b = Pencil/freehand tool
+      t = Text tool            n = Node editor
+      s = Star/polygon tool    g = Gradient tool
+      d = Color dropper        i = Color dropper (alt)
+      space = Select/move tool (pointer)
+      
+    COMMON SHORTCUTS:
+      ctrl+z = Undo            ctrl+y = Redo
+      ctrl+s = Save            ctrl+shift+s = Save As
+      ctrl+c = Copy            ctrl+v = Paste
+      ctrl+d = Duplicate       delete = Delete selected
+      ctrl+g = Group           ctrl+shift+g = Ungroup
+      ctrl+shift+e = Export PNG dialog
+      
+    VIEW:
+      + or = = Zoom in         - = Zoom out
+      5 = Zoom to fit page     1 = Zoom 1:1
+      3 = Zoom to selection
+      
+    OBJECT:
+      ctrl+shift+f = Fill & Stroke dialog
+      page_up = Raise           page_down = Lower
+      home = Raise to top       end = Lower to bottom
+      
+    Examples: 'r', 'ctrl+z', 'ctrl+shift+e', 'delete'
+    """
+    ok, msg = remote.key(keys)
+    return msg
+
+
+@mcp.tool()
+def inkpilot_type(text: str) -> str:
+    """Type text into Inkscape (for text tool, dialogs, rename fields, etc.).
+    Make sure the text tool is active and cursor is placed first."""
+    ok, msg = remote.type_text(text)
+    return msg
+
+
+@mcp.tool()
+def inkpilot_scroll(x: int, y: int, clicks: int = 3,
+                    direction: str = "down") -> str:
+    """Scroll in the Inkscape window at position (x, y).
+    direction: 'up' or 'down'. Use ctrl+scroll for zoom.
+    For zoom: use inkpilot_key('+') or inkpilot_key('-') instead."""
+    ok, msg = remote.scroll(x, y, clicks, direction)
+    return msg
+
+
+@mcp.tool()
+def inkpilot_window_info() -> str:
+    """Get info about the Inkscape window: position, size, title.
+    Also returns the current canvas coordinate mapping so you know
+    exactly where to draw without needing a screenshot."""
+    ok, info = remote.get_window_info()
+    if ok:
+        return (f"Title: {info['title']}\n"
+                f"Position: ({info['left']}, {info['top']})\n"
+                f"Size: {info['width']}x{info['height']}\n"
+                f"Active: {info['is_active']}")
+    return f"Error: {info.get('error', 'Unknown')}"
+
+
+# ══════════════════════════════════════════════════════════════════
+# INTROSPECTION — Know what's on the canvas
+# ══════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def inkpilot_read_canvas() -> str:
-    """Read detailed info about every element on the canvas.
-    Returns positions, sizes, colors, path data, and styles for ALL elements.
+    """Read the SVG file to inspect element IDs, positions, and styles.
     
-    USE THIS to inspect your work after drawing. Essential for:
-    - Checking if shapes are positioned correctly
-    - Verifying colors and styles
-    - Finding element IDs for Inkscape actions
-    - Comparing your output to a reference
-    - Debugging layout issues
+    This reads the file on disk — make sure Inkscape has saved first
+    (use inkpilot_key('ctrl+s') before calling this).
     
-    Call this FREQUENTLY to see what you've drawn and make corrections."""
-    state = canvas.get_state()
-    details = canvas.get_elements_detail()
+    Returns element details for use with inkpilot_inkscape_action's select_ids."""
+    state = reader.get_state()
+    details = reader.get_elements_detail()
     return f"{state}\n\nElements:\n{details}"
 
 
 @mcp.tool()
-def inkpilot_refresh_inkscape() -> str:
-    """Reopen the current canvas in Inkscape to see latest changes.
-    Call this after a batch of drawing operations so the user sees the update."""
-    _save_to_disk_now()
-    return open_in_inkscape(WORK_FILE, force_reload=True)
+def inkpilot_get_state() -> str:
+    """Quick summary of the SVG file: dimensions, layers, element count."""
+    return doc.summary()
+
+
+# ══════════════════════════════════════════════════════════════════
+# BLENDER — 3D modeling, rendering, Grease Pencil 2D
+# ══════════════════════════════════════════════════════════════════
+
+from bridge.adapters.blender import BlenderConnection
+blender = BlenderConnection()
+
+
+def _fmt(resp):
+    """Format a Blender response into readable text."""
+    if resp.get("status") == "ok":
+        import json as _json
+        return _json.dumps(resp["result"], indent=2)
+    return f"Error: {resp.get('message', 'Unknown error')}"
 
 
 @mcp.tool()
-def inkpilot_save(filename: str = None, open_in_inkscape: bool = False) -> str:
-    """Save a copy of the canvas to the output folder.
-    The working file is always at ~/.inkpilot/canvas.svg.
-    This saves an additional named copy to ~/.inkpilot/output/."""
-    if not filename:
-        filename = f"inkpilot_{int(time.time())}.svg"
-    path = os.path.join(OUTPUT_DIR, filename)
-    canvas.save(path)
-    result = f"Saved to {path}"
-    if open_in_inkscape:
-        from .inkscape import open_in_inkscape as _open
-        result += "\n" + _open(path)
-    return result
+def blender_ping() -> str:
+    """Check if Blender is connected and get scene summary.
+    Returns Blender version, scene name, and object count.
+    Make sure Blender is open with the Inkpilot addon enabled."""
+    return _fmt(blender.send("ping"))
+
+
+@mcp.tool()
+def blender_get_scene() -> str:
+    """Get full info about the current Blender scene.
+    Returns all objects with names, types, locations, materials, and render settings.
+    Call this first to understand what's in the scene."""
+    return _fmt(blender.send("get_scene_info"))
+
+
+@mcp.tool()
+def blender_get_object(name: str) -> str:
+    """Get detailed info about one object: vertices, faces, materials, transforms."""
+    return _fmt(blender.send("get_object_info", {"name": name}))
+
+
+@mcp.tool()
+def blender_create_object(
+    object_type: str = "cube",
+    name: str = None,
+    location: list = None,
+    rotation: list = None,
+    scale: list = None,
+    size: float = None,
+    radius: float = None,
+    depth: float = None,
+    material_color: str = None,
+    text: str = None,
+    light_type: str = None,
+    energy: float = None,
+) -> str:
+    """Create a 3D object in Blender.
+    
+    object_type: cube, sphere, cylinder, cone, plane, torus, monkey,
+                 text, camera, light, empty
+    name: optional name for the object
+    location: [x, y, z] position (default [0,0,0])
+    rotation: [rx, ry, rz] in degrees
+    scale: [sx, sy, sz] scale factors
+    size: size for cube/plane/monkey (default 2)
+    radius: radius for sphere/cylinder/cone (default 1)
+    depth: depth for cylinder/cone (default 2)
+    material_color: hex color like '#ff3333' to auto-apply
+    text: text content (for text objects)
+    light_type: POINT, SUN, SPOT, AREA (for light objects)
+    energy: light intensity (for light objects)
+    """
+    params = {"object_type": object_type}
+    if name: params["name"] = name
+    if location: params["location"] = location
+    if rotation: params["rotation"] = rotation
+    if scale: params["scale"] = scale
+    if size is not None: params["size"] = size
+    if radius is not None: params["radius"] = radius
+    if depth is not None: params["depth"] = depth
+    if material_color: params["material_color"] = material_color
+    if text: params["text"] = text
+    if light_type: params["light_type"] = light_type
+    if energy is not None: params["energy"] = energy
+    return _fmt(blender.send("create_object", params))
+
+
+@mcp.tool()
+def blender_delete_object(name: str) -> str:
+    """Delete an object by name."""
+    return _fmt(blender.send("delete_object", {"name": name}))
+
+
+@mcp.tool()
+def blender_modify_object(
+    name: str,
+    location: list = None,
+    rotation: list = None,
+    scale: list = None,
+    visible: bool = None,
+    new_name: str = None,
+) -> str:
+    """Move, rotate, scale, rename, or hide an object.
+    
+    name: object to modify
+    location: [x, y, z]
+    rotation: [rx, ry, rz] in degrees
+    scale: [sx, sy, sz]
+    visible: show/hide
+    new_name: rename the object
+    """
+    params = {"name": name}
+    if location: params["location"] = location
+    if rotation: params["rotation"] = rotation
+    if scale: params["scale"] = scale
+    if visible is not None: params["visible"] = visible
+    if new_name: params["new_name"] = new_name
+    return _fmt(blender.send("modify_object", params))
+
+
+@mcp.tool()
+def blender_duplicate_object(name: str, new_name: str = None, offset: list = None) -> str:
+    """Duplicate an object. Optional new_name and offset [x,y,z]."""
+    params = {"name": name}
+    if new_name: params["new_name"] = new_name
+    if offset: params["offset"] = offset
+    return _fmt(blender.send("duplicate_object", params))
+
+
+@mcp.tool()
+def blender_set_material(
+    name: str,
+    color: str = None,
+    metallic: float = None,
+    roughness: float = None,
+    emission_color: str = None,
+    emission_strength: float = None,
+) -> str:
+    """Set material on an object. Supports PBR properties.
+    
+    name: object name
+    color: hex color '#rrggbb' or [r,g,b] 0-1
+    metallic: 0.0 (plastic) to 1.0 (metal)
+    roughness: 0.0 (mirror) to 1.0 (matte)
+    emission_color: hex color for glow
+    emission_strength: glow intensity
+    """
+    params = {"name": name}
+    if color: params["color"] = color
+    if metallic is not None: params["metallic"] = metallic
+    if roughness is not None: params["roughness"] = roughness
+    if emission_color: params["emission_color"] = emission_color
+    if emission_strength is not None: params["emission_strength"] = emission_strength
+    return _fmt(blender.send("set_material", params))
+
+
+@mcp.tool()
+def blender_set_camera(
+    location: list = None,
+    rotation: list = None,
+    look_at: list = None,
+    focal_length: float = None,
+) -> str:
+    """Set up the camera. Use look_at=[x,y,z] to point at a target."""
+    params = {}
+    if location: params["location"] = location
+    if rotation: params["rotation"] = rotation
+    if look_at: params["look_at"] = look_at
+    if focal_length: params["focal_length"] = focal_length
+    return _fmt(blender.send("set_camera", params))
+
+
+@mcp.tool()
+def blender_add_light(
+    light_type: str = "POINT",
+    location: list = None,
+    energy: float = 1000,
+    color: list = None,
+    name: str = None,
+) -> str:
+    """Add a light. Types: POINT, SUN, SPOT, AREA."""
+    params = {"light_type": light_type, "energy": energy}
+    if location: params["location"] = location
+    if color: params["color"] = color
+    if name: params["name"] = name
+    return _fmt(blender.send("add_light", params))
+
+
+@mcp.tool()
+def blender_set_world(color: str = None, strength: float = None) -> str:
+    """Set world/environment background color and strength."""
+    params = {}
+    if color: params["color"] = color
+    if strength is not None: params["strength"] = strength
+    return _fmt(blender.send("set_world", params))
+
+
+@mcp.tool()
+def blender_clear_scene(object_type: str = None) -> str:
+    """Clear the scene. Optional type filter: MESH, LIGHT, CAMERA, etc."""
+    params = {}
+    if object_type: params["type"] = object_type
+    return _fmt(blender.send("clear_scene", params))
+
+
+@mcp.tool()
+def blender_render(
+    output_path: str = None,
+    format: str = "PNG",
+) -> str:
+    """Render the scene to an image file.
+    output_path: where to save (default: temp folder)
+    format: PNG, JPEG, BMP, TIFF
+    """
+    if not output_path:
+        output_path = os.path.join(OUTPUT_DIR, f"render_{int(time.time())}.png")
+    params = {"output_path": output_path, "format": format}
+    return _fmt(blender.send("render", params))
+
+
+@mcp.tool()
+def blender_set_render_settings(
+    engine: str = None,
+    resolution_x: int = None,
+    resolution_y: int = None,
+    samples: int = None,
+    film_transparent: bool = None,
+) -> str:
+    """Configure render settings.
+    engine: CYCLES (realistic) or BLENDER_EEVEE_NEXT (fast)
+    samples: quality (higher = better but slower). 128 is good for preview, 512+ for final.
+    film_transparent: transparent background (for sprites/assets).
+    """
+    params = {}
+    if engine: params["engine"] = engine
+    if resolution_x: params["resolution_x"] = resolution_x
+    if resolution_y: params["resolution_y"] = resolution_y
+    if samples: params["samples"] = samples
+    if film_transparent is not None: params["film_transparent"] = film_transparent
+    return _fmt(blender.send("set_render_settings", params))
+
+
+@mcp.tool()
+def blender_screenshot_viewport(output_path: str = None) -> str:
+    """Capture a quick viewport screenshot (faster than full render)."""
+    if not output_path:
+        output_path = os.path.join(OUTPUT_DIR, f"viewport_{int(time.time())}.png")
+    return _fmt(blender.send("screenshot_viewport", {"output_path": output_path}))
+
+
+@mcp.tool()
+def blender_execute_code(code: str) -> str:
+    """Execute arbitrary Python code in Blender (bpy API).
+    
+    Use this for anything the other tools don't cover.
+    You have access to: bpy, mathutils, math, bmesh, os, json.
+    
+    ALWAYS save your work first. This is powerful but can break things.
+    
+    Examples:
+      'bpy.ops.mesh.primitive_ico_sphere_add(radius=2)'
+      'bpy.context.scene.render.engine = "CYCLES"'
+      'print([o.name for o in bpy.data.objects])'
+    """
+    return _fmt(blender.send("execute_code", {"code": code}))
+
+
+@mcp.tool()
+def blender_grease_pencil_create(name: str = "Drawing", layer_name: str = "Lines") -> str:
+    """Create a Grease Pencil object for 2D drawing in 3D space."""
+    return _fmt(blender.send("create_grease_pencil", {"name": name, "layer_name": layer_name}))
+
+
+@mcp.tool()
+def blender_grease_pencil_stroke(
+    points: list,
+    gp_name: str = "Drawing",
+    layer_name: str = "Lines",
+    color: str = "#000000",
+    line_width: int = 10,
+) -> str:
+    """Draw a stroke on a Grease Pencil object.
+    
+    points: [[x,y,z], [x,y,z], ...] — 3D coordinates for the stroke
+    color: hex color
+    line_width: stroke thickness
+    """
+    return _fmt(blender.send("draw_grease_pencil_stroke", {
+        "gp_name": gp_name, "layer_name": layer_name,
+        "points": points, "color": color, "line_width": line_width,
+    }))
 
 
 # ── Entry Point ──────────────────────────────────────────────────
 
 def run():
-    ink = find_inkscape()
-    config = _load_config()
-    print("[Inkpilot] MCP server starting...", file=sys.stderr, flush=True)
+    print("[Inkpilot] MCP server starting (v5.0 — Blender + Inkscape)...", file=sys.stderr, flush=True)
     print(f"[Inkpilot] Working file: {WORK_FILE}", file=sys.stderr, flush=True)
     print(f"[Inkpilot] Output dir: {OUTPUT_DIR}", file=sys.stderr, flush=True)
-    print(f"[Inkpilot] Live preview: http://localhost:7878 ({'auto-open' if config.get('live_preview') else 'manual'})", file=sys.stderr, flush=True)
-    if ink:
-        print(f"[Inkpilot] Inkscape: {ink}", file=sys.stderr, flush=True)
-    else:
-        print("[Inkpilot] WARNING: Inkscape not found!", file=sys.stderr, flush=True)
+    print(f"[Inkpilot] Inkscape: {adapter._inkscape_path or 'NOT FOUND'}", file=sys.stderr, flush=True)
+    print(f"[Inkpilot] Blender: checking port 9876...", file=sys.stderr, flush=True)
+    print(f"[Inkpilot] Blender connected: {blender.is_alive()}", file=sys.stderr, flush=True)
+    
     mcp.run(transport="stdio")

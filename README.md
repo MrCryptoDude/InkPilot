@@ -1,35 +1,35 @@
-# Inkpilot — AI Copilot for Inkscape
+# Inkpilot — Claude AI x Blender Bridge
 
-**Describe what you want. Watch Claude draw it live.**
+**Tell Claude what to build. Watch it appear in Blender.**
 
-Inkpilot bridges Claude AI to Inkscape via MCP (Model Context Protocol). You describe a character, sprite, or icon — Claude draws it path by path into a real SVG canvas with separate layers. Watch every stroke appear live in your browser, then open the final result in Inkscape to edit.
+Inkpilot connects Claude AI to Blender through MCP (Model Context Protocol). Describe a scene, character, or object in plain English — Claude creates it directly in your Blender viewport. Full 3D modeling, materials, lighting, rendering, and even 2D art via Grease Pencil.
 
-Built for indie game developers who need layered SVG sprites that AI image generators can't make.
+No terminal commands. No config files. Just a toggle switch.
 
 ---
 
 ## Why Inkpilot?
 
-AI image generators (DALL-E, Midjourney, Stable Diffusion) output flat PNGs. If you're building a game and need:
+Other Blender-AI bridges require installing `uv`, editing JSON config files, running terminal commands, and debugging connection issues. Inkpilot is **one toggle switch**:
 
-- **Separated body parts** (arms, legs, body on different layers for animation)
-- **Editable vector art** (not locked raster images)
-- **Paper Mario / Angry Birds style** characters
-- **Fast iteration** without waiting in generation queues
-
-...then you need Inkpilot.
+1. Toggle ON in the desktop app
+2. Enable the addon in Blender
+3. Open Claude Desktop
+4. Start creating
 
 ---
 
 ## Features
 
-- **Live Drawing Preview** — Watch Claude paint stroke by stroke in a browser window via Server-Sent Events
-- **Layered SVG Output** — Each body part on its own Inkscape layer (arm, body, tail, etc.)
-- **Editable Vectors** — Every path, shape, and curve is fully editable in Inkscape
-- **Desktop App** — One-click install, auto-detects Inkscape (including Microsoft Store installs)
-- **Live Preview Toggle** — Turn off if you just want the final result
-- **Pixel Art Support** — Grid-perfect pixel art using SVG rects
-- **Auto-saves** — Canvas saves to disk after every operation
+- **Zero-config setup** — Desktop app handles everything
+- **Full Blender control** — Objects, materials, cameras, lights, rendering
+- **Grease Pencil 2D** — Draw 2D art in 3D space
+- **PBR Materials** — Metallic, roughness, emission, colors
+- **Scene inspection** — Claude can see what's in your scene
+- **Code execution** — Run any bpy Python code through Claude
+- **Viewport screenshots** — Claude can capture what Blender sees
+- **Full renders** — Cycles or EEVEE rendering to PNG
+- **Auto-start** — Bridge server starts when Blender opens
 
 ---
 
@@ -38,13 +38,13 @@ AI image generators (DALL-E, Midjourney, Stable Diffusion) output flat PNGs. If 
 ### Prerequisites
 
 - [Python 3.10+](https://python.org)
-- [Inkscape](https://inkscape.org) (any install method — standard, Microsoft Store, etc.)
+- [Blender 3.0+](https://blender.org) (tested on 5.0.1)
 - [Claude Desktop](https://claude.ai/download)
 
 ### Install
 
 ```bash
-git clone https://github.com/YourUsername/Inkpilot.git
+git clone https://github.com/AIMindSpark/Inkpilot.git
 cd Inkpilot
 python -m venv .venv
 
@@ -54,58 +54,132 @@ python -m venv .venv
 # Mac/Linux
 source .venv/bin/activate
 
-pip install -r requirements.txt
+pip install -r requirements_mcp.txt
 ```
 
 ### Setup
 
-1. **Close Claude Desktop** (quit fully from system tray)
-2. **Launch Inkpilot:**
+1. **Launch the Inkpilot desktop app:**
    ```bash
    python inkpilot_tray.py
    ```
-3. Click **Connect** in the Inkpilot window
-4. **Open Claude Desktop** — it detects Inkpilot automatically
-5. Ask Claude to draw something!
 
-### Build Desktop App (Windows)
+2. **Toggle ON "Blender Bridge"** — This copies the addon to Blender's addons folder
 
-```bash
-python build_icon.py   # Generate icon from SVG
-python build.py        # Build standalone .exe
+3. **Open Blender** and enable the addon:
+   - Go to `Edit > Preferences > Add-ons`
+   - Search for **"Inkpilot"**
+   - Tick the checkbox to enable it
+   - You'll see `[Inkpilot] Bridge started on 127.0.0.1:9876` in the console
+
+4. **Close Claude Desktop** completely (right-click system tray icon → Quit)
+
+5. **Reopen Claude Desktop** — It detects Inkpilot automatically
+
+6. **Start creating!** Tell Claude to build something in Blender.
+
+### Verify the connection
+
+In Blender's 3D viewport, press **N** to open the sidebar. You'll see an **Inkpilot** tab showing the bridge status.
+
+### To disable
+
+Toggle OFF "Blender Bridge" in the desktop app and restart Claude Desktop.
+
+---
+
+## Example Prompts
+
 ```
+"Clear the scene and create a low-poly island with water, sand, and palm trees"
 
-Output: `dist/Inkpilot/Inkpilot.exe`
+"Make a metallic red sports car — use cylinders for wheels and cubes for the body"
+
+"Set up studio lighting with a 3-point light rig and render the scene"
+
+"Create a Grease Pencil character — draw a stick figure with thick black lines"
+
+"Build a chess set — all 32 pieces on an 8x8 board with alternating materials"
+
+"Make the background a sunset gradient and render at 1920x1080"
+```
 
 ---
 
 ## How It Works
 
 ```
-You (Claude Desktop)              Inkpilot MCP Server              Inkscape
-      |                                  |                            |
-      |  "Draw a beaver with             |                            |
-      |   separate arm layer"            |                            |
-      |  ─────────────────────────────>  |                            |
-      |                                  |  setup_canvas(512, 512)    |
-      |                                  |  create_layer("Body")      |
-      |                                  |  draw_path(body shape)     |
-      |                                  |  create_layer("Left Arm")  |
-      |                                  |  draw_path(arm shape)      |
-      |                                  |          |                 |
-      |                                  |    SSE stream ──> Browser  |
-      |                                  |    (live preview)          |
-      |                                  |          |                 |
-      |                                  |  save("beaver.svg") ────> Opens in Inkscape
-      |  <─────────────────────────────  |                            |
-      |  "Done! Saved to output folder"  |                            |
+You (Claude Desktop)
+    │
+    ▼
+Inkpilot MCP Server (Python, runs via stdio)
+    │
+    ▼  TCP socket (localhost:9876)
+    │
+Blender Addon (runs inside Blender)
+    │
+    ▼  bpy API (main thread via timers)
+    │
+Blender Viewport (you see changes live)
 ```
 
 1. You describe what you want in Claude Desktop
-2. Claude calls Inkpilot's drawing tools via MCP
-3. Each tool call updates an in-memory SVG canvas
-4. The Live Preview server pushes updates to your browser via SSE
-5. When done, the final SVG opens in Inkscape — fully layered and editable
+2. Claude calls Inkpilot's Blender tools via MCP
+3. The MCP server sends JSON commands over TCP to the Blender addon
+4. The addon executes commands on Blender's main thread (thread-safe)
+5. Objects, materials, and lights appear in your viewport instantly
+
+---
+
+## Blender Tools
+
+Inkpilot exposes these tools to Claude:
+
+### Scene
+| Tool | Description |
+|------|-------------|
+| `blender_ping` | Check connection, get Blender version and scene summary |
+| `blender_get_scene` | List all objects with transforms, materials, render settings |
+| `blender_get_object` | Detailed info: vertices, faces, materials, dimensions |
+| `blender_clear_scene` | Delete all objects (or filter by type: MESH, LIGHT, etc.) |
+
+### Objects
+| Tool | Description |
+|------|-------------|
+| `blender_create_object` | Create cube, sphere, cylinder, cone, plane, torus, monkey, text, camera, light, empty |
+| `blender_delete_object` | Remove an object by name |
+| `blender_modify_object` | Move, rotate, scale, rename, show/hide |
+| `blender_duplicate_object` | Copy an object with optional offset |
+
+### Materials
+| Tool | Description |
+|------|-------------|
+| `blender_set_material` | Apply PBR material: color, metallic, roughness, emission |
+
+### Camera & Lighting
+| Tool | Description |
+|------|-------------|
+| `blender_set_camera` | Position camera, look-at target, focal length |
+| `blender_add_light` | Add POINT, SUN, SPOT, or AREA light |
+| `blender_set_world` | Set background color and strength |
+
+### Rendering
+| Tool | Description |
+|------|-------------|
+| `blender_render` | Full render to PNG (Cycles or EEVEE) |
+| `blender_set_render_settings` | Engine, resolution, samples, transparent background |
+| `blender_screenshot_viewport` | Quick viewport capture |
+
+### 2D Drawing
+| Tool | Description |
+|------|-------------|
+| `blender_grease_pencil_create` | Create a Grease Pencil object |
+| `blender_grease_pencil_stroke` | Draw strokes with color and width |
+
+### Advanced
+| Tool | Description |
+|------|-------------|
+| `blender_execute_code` | Run arbitrary Python (bpy) code in Blender |
 
 ---
 
@@ -113,107 +187,85 @@ You (Claude Desktop)              Inkpilot MCP Server              Inkscape
 
 ```
 Inkpilot/
-├── inkpilot_tray.py          # Desktop app (CustomTkinter window)
-├── run_mcp.py                # MCP server entry point
-├── build.py                  # PyInstaller build script
-├── build_icon.py             # SVG → ICO converter
+├── inkpilot_tray.py              # Desktop app (toggle switch UI)
+├── run_mcp.py                    # MCP server entry point
 │
-├── inkpilot_mcp/             # Core MCP server
-│   ├── server.py             # FastMCP tools (draw_path, draw_rect, etc.)
-│   ├── canvas.py             # In-memory SVG canvas with change notifications
-│   ├── inkscape.py           # Inkscape detection (PATH, Store, PowerShell)
-│   ├── live_server.py        # HTTP + SSE server for live preview
-│   └── viewer/
-│       └── index.html        # Live preview browser UI
+├── inkpilot_mcp/
+│   └── server.py                 # MCP tools (blender_* and inkpilot_*)
 │
-├── assets/                   # Built icon files
-└── dist/                     # PyInstaller output
+├── blender/
+│   └── addon.py                  # Blender addon (TCP server + command handler)
+│
+├── bridge/
+│   ├── engine.py                 # In-memory SVG engine (Inkscape backend)
+│   └── adapters/
+│       ├── blender.py            # TCP client for Blender bridge
+│       └── inkscape.py           # Inkscape CLI adapter
+│
+└── assets/                       # Icons and images
 ```
+
+### Desktop App (`inkpilot_tray.py`)
+- Detects Blender installation
+- Copies addon to Blender's addons folder
+- Registers MCP server in Claude Desktop's config
+- No terminal commands needed
+
+### MCP Server (`inkpilot_mcp/server.py`)
+- Exposes 17+ Blender tools + Inkscape tools
+- Connects to Blender addon via TCP socket
+- Runs as stdio MCP server (launched by Claude Desktop)
+
+### Blender Addon (`blender/addon.py`)
+- TCP socket server running inside Blender (port 9876)
+- Commands execute on main thread via `bpy.app.timers`
+- Auto-starts when addon is enabled
+- Sidebar panel shows connection status
 
 ---
 
-## MCP Tools
+## Troubleshooting
 
-Inkpilot exposes these tools to Claude:
+### "Blender not connected" error
+1. Make sure Blender is open
+2. Check the addon is enabled: `Edit > Preferences > Add-ons > search "Inkpilot"`
+3. Look for `[Inkpilot] Bridge started` in Blender's system console (`Window > Toggle System Console`)
 
-| Tool | Description |
-|------|-------------|
-| `inkpilot_setup_canvas` | Initialize canvas size, open live preview |
-| `inkpilot_create_layer` | Create a named layer (Body, Arms, etc.) |
-| `inkpilot_switch_layer` | Switch active layer |
-| `inkpilot_draw_path` | Draw SVG paths (curves, outlines, shapes) |
-| `inkpilot_draw_rect` | Draw rectangles |
-| `inkpilot_draw_circle` | Draw circles |
-| `inkpilot_draw_polygon` | Draw polygons |
-| `inkpilot_draw_pixel_region` | Pixel art (batch of colored rects) |
-| `inkpilot_draw_pixel_row` | Pixel art scanline |
-| `inkpilot_draw_text` | Add text elements |
-| `inkpilot_insert_svg` | Insert raw SVG markup |
-| `inkpilot_delete` | Delete an element by ID |
-| `inkpilot_save` | Save to output folder, optionally open in Inkscape |
-| `inkpilot_get_state` | Get canvas info (size, layers, elements) |
+### Claude doesn't see Inkpilot tools
+1. Make sure you fully quit Claude Desktop (system tray → Quit)
+2. Reopen Claude Desktop
+3. The hammer icon should show Inkpilot tools
 
----
+### Addon not showing in Blender
+1. Run the desktop app and toggle Blender Bridge ON
+2. Check the file exists: `%APPDATA%\Blender Foundation\Blender\5.0\scripts\addons\inkpilot_bridge.py`
+3. Restart Blender after installing
 
-## Example Prompts
-
-```
-"Draw a side-view beaver character in Paper Mario style with separate
- layers for: left arm, left foot, tail, and body with head"
-
-"Create a 32x32 pixel art sword with a brown hilt and silver blade"
-
-"Design a fantasy health bar — ornate gold frame, red fill gradient"
-
-"Make a set of 16x16 terrain tiles: grass, dirt, water, stone"
-
-"Draw a character walk cycle — 4 frames on separate layers"
-```
-
----
-
-## Desktop App Features
-
-The Inkpilot desktop window shows:
-
-- **LLM Connection** — Status of Claude Desktop integration
-- **Inkscape Detection** — Auto-finds Inkscape installation
-- **Live Preview Toggle** — Watch drawing live or just get the result
-- **Connect / Disconnect** — One-click Claude Desktop setup
-- **Quick Actions** — Open Inkscape, preview, output folder
-- **Getting Started Guide** — Step-by-step setup instructions
-
----
-
-## Configuration
-
-Settings stored in `~/.inkpilot/config.json`:
-
-```json
-{
-  "live_preview": true
-}
-```
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `live_preview` | `true` | Auto-open browser for live drawing preview |
+### Render crashes or times out
+- Complex renders can exceed the default 30-second timeout
+- Use `blender_set_render_settings` to lower samples for previews
+- Use EEVEE instead of Cycles for faster renders
 
 ---
 
 ## Roadmap
 
-- [x] MCP server with drawing tools
-- [x] Live browser preview (SSE)
-- [x] Desktop app with CustomTkinter
-- [x] Auto-detect Inkscape (Store, standard, PATH)
-- [x] PyInstaller build for Windows
-- [ ] Multi-LLM support (OpenAI, local models)
-- [ ] Built-in chat panel (skip Claude Desktop)
-- [ ] DALL-E → auto-trace → SVG import
-- [ ] Animation timeline preview
-- [ ] Export to Godot-ready sprite sheets
-- [ ] Template library (characters, UI kits, tilesets)
+- [x] Blender bridge with TCP socket addon
+- [x] Desktop app with one-toggle setup
+- [x] Full 3D object creation and manipulation
+- [x] PBR materials
+- [x] Camera and lighting control
+- [x] Rendering (Cycles + EEVEE)
+- [x] Grease Pencil 2D drawing
+- [x] Arbitrary code execution
+- [x] Auto-detect Blender installation
+- [ ] DALL-E image generation → Blender texture import
+- [ ] HDRI environment lighting
+- [ ] Animation and keyframes
+- [ ] Geometry Nodes control
+- [ ] Multi-LLM support (Claude.ai web, local models)
+- [ ] Export to game engines (Godot, Unity)
+- [ ] Photoshop / Illustrator adapters
 - [ ] Mac and Linux builds
 
 ---
